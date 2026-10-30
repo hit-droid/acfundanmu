@@ -359,13 +359,13 @@ func (ac *AcFunLive) clientStart(ctx context.Context, event bool, errCh chan<- e
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		// 顺序处理每条 payload：避免为每条消息新建 goroutine 带来的调度与 GC 开销，
+		// 同时保证握手/注册/心跳等写操作的先后顺序（并发处理会打乱该顺序）
 		for stream := range payloadCh {
-			go func(stream *acproto.DownstreamPayload) {
-				err := ac.handleCommand(clientCtx, stream, event)
-				if err != nil {
-					log.Printf("处理接收到的弹幕数据出现错误：%v", err)
-				}
-			}(stream)
+			err := ac.handleCommand(clientCtx, stream, event)
+			if err != nil {
+				log.Printf("处理接收到的弹幕数据出现错误：%v", err)
+			}
 		}
 	}()
 

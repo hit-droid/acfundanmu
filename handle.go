@@ -8,12 +8,30 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"sort"
+	"slices"
+	"sync"
 
 	"github.com/orzogc/acfundanmu/acproto"
 
 	"google.golang.org/protobuf/proto"
 )
+
+// gzipReaderPool 复用 gzip.Reader，避免每条压缩弹幕都重新分配，降低 GC 压力
+var gzipReaderPool = sync.Pool{
+	New: func() any {
+		return new(gzip.Reader)
+	},
+}
+
+// decompressGzip 解压 GZIP 数据，复用 gzip.Reader 以减少内存分配
+func decompressGzip(data []byte) ([]byte, error) {
+	gr := gzipReaderPool.Get().(*gzip.Reader)
+	defer gzipReaderPool.Put(gr)
+	if err := gr.Reset(bytes.NewReader(data)); err != nil {
+		return nil, err
+	}
+	return io.ReadAll(gr)
+}
 
 // 处理接受到的数据里的命令
 func (ac *AcFunLive) handleCommand(ctx context.Context, stream *acproto.DownstreamPayload, event bool) (e error) {
@@ -96,10 +114,7 @@ func (ac *AcFunLive) handleCommand(ctx context.Context, stream *acproto.Downstre
 		checkErr(err)
 		payload := message.Payload
 		if message.CompressionType == acproto.ZtLiveScMessage_GZIP {
-			r, err := gzip.NewReader(bytes.NewReader(message.Payload))
-			checkErr(err)
-			defer r.Close()
-			payload, err = io.ReadAll(r)
+			payload, err = decompressGzip(message.Payload)
 			checkErr(err)
 		}
 		switch message.MessageType {
@@ -354,10 +369,10 @@ func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 		}
 	}
 
-	// 按 SendTime 大小排序
-	sort.Slice(danmu, func(i, j int) bool {
-		return danmu[i].GetSendTime() < danmu[j].GetSendTime()
-	})
+	// 按 SendTime 大小排序（上游通常已按时间有序，先检测可跳过排序以提速）
+	if !slices.IsSortedFunc(danmu, danmuLess) {
+		slices.SortFunc(danmu, danmuLess)
+	}
 
 	for _, d := range danmu {
 		if event {
@@ -603,6 +618,16 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 				})
 			}
 		case "CommonStateSignalLiveState":
+			liveState := &acproto.CommonStateSignalLiveState{}
+			err = proto.Unmarshal(item.Payload, liveState)
+			checkErr(err)
+			if event {
+				ac.callEvent(liveStateEvent, &LiveState{
+					A: liveState.A,
+					B: liveState.B,
+					C: liveState.C,
+				})
+			}
 		case "CommonStateSignalArLiveTreasureBoxState":
 		default:
 			log.Printf("未知的State Signal item.SignalType：%s\npayload string:\n%s\npayload base64:\n%s\n",
@@ -613,12 +638,23 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 	}
 }
 
+// danmuLess 比较两个 DanmuMessage 的发送时间，供 slices 排序使用（无堆分配）
+func danmuLess(a, b DanmuMessage) int {
+	at, bt := a.GetSendTime(), b.GetSendTime()
+	if at < bt {
+		return -1
+	}
+	if at > bt {
+		return 1
+	}
+	return 0
+}
+
 // 处理 notify signal 数据
 func (ac *AcFunLive) handleNotifySignal(payload *[]byte, event bool) {
 	notifySignal := &acproto.ZtLiveScNotifySignal{}
 	err := proto.Unmarshal(*payload, notifySignal)
 	checkErr(err)
-
 	for _, item := range notifySignal.Item {
 		switch item.SignalType {
 		case "CommonNotifySignalKickedOut":

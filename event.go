@@ -36,6 +36,7 @@ const (
 	kickedOutEvent
 	violationAlertEvent
 	managerStateEvent
+	liveStateEvent
 )
 
 // 事件 handler
@@ -263,5 +264,12 @@ func (ac *AcFunLive) OnViolationAlert(handler func(ac *AcFunLive, violationConte
 func (ac *AcFunLive) OnManagerState(handler func(*AcFunLive, ManagerState)) {
 	ac.handlerMap.add(managerStateEvent, func(ac *AcFunLive, i any) {
 		handler(ac, i.(ManagerState))
+	})
+}
+
+// OnLiveState 处理直播状态信号，handler 需要支持并行处理，可以多次调用
+func (ac *AcFunLive) OnLiveState(handler func(*AcFunLive, *LiveState)) {
+	ac.handlerMap.add(liveStateEvent, func(ac *AcFunLive, i any) {
+		handler(ac, i.(*LiveState))
 	})
 }

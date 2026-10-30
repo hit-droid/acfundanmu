@@ -432,6 +432,13 @@ type DisplayInfo struct {
 	LikeDelta     int    `json:"likeDelta"`     // 点赞增加数量
 }
 
+// LiveState 就是直播状态信号（CommonStateSignalLiveState），字段为 AcFun 原始协议字段
+type LiveState struct {
+	A int32  `json:"a"`
+	B int32  `json:"b"`
+	C string `json:"c"`
+}
+
 // LiveInfo 就是直播间的相关状态信息
 type LiveInfo struct {
 	KickedOut        string       `json:"kickedOut"`        // 被踢理由？
