@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/orzogc/acfundanmu/acproto"
+	"github.com/valyala/bytebufferpool"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -90,14 +91,36 @@ func BenchmarkGzipDecode_Old(b *testing.B) {
 	}
 }
 
-// BenchmarkGzipDecode_New 新实现（复用 gzip.Reader 池）
+// BenchmarkGzipDecode_New 新实现（复用 gzip.Reader 池 + bytebufferpool 输出缓冲 + bytes.Reader 池）
 func BenchmarkGzipDecode_New(b *testing.B) {
 	data := gzippedActionSignal(50)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := decompressGzip(data); err != nil {
+		bb, err := decompressGzip(data)
+		if err != nil {
 			b.Fatal(err)
 		}
+		bytebufferpool.Put(bb)
+	}
+}
+
+// BenchmarkCallEvent_Single 测量仅注册单个 handler 时的事件分发开销。
+// 优化前每条弹幕都会为此新起一个 goroutine（协程抖动），优化后直接同步调用，
+// 这里通过 allocs/op 与 ns/op 的下降佐证该开销被消除。
+func BenchmarkCallEvent_Single(b *testing.B) {
+	ac := newBenchAc()
+	ac.OnComment(func(ac *AcFunLive, d *Comment) {})
+	comment := &Comment{
+		DanmuCommon: DanmuCommon{
+			SendTime: 1,
+			UserInfo: UserInfo{UserID: 123, Nickname: "tester"},
+		},
+		Content: "bench",
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ac.callEvent(commentDanmu, comment)
 	}
 }

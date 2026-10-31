@@ -56,22 +56,41 @@ func (h *handlerMap) add(t eventType, f eventHandler) {
 }
 
 // 调用事件 handler 列表里的 handler
+//
+// 性能：绝大多数场景下单个事件只注册了一个 handler，原先每条弹幕都为此新起一个 goroutine，
+// 在高弹幕量下会产生大量短生命周期协程，带来调度与 GC 开销（协程抖动）。
+// 这里改为：仅有一个 handler 时直接同步调用（不新起协程）；有多个 handler 时才并发派发，
+// 既保留了多 handler 的并行语义，又消除了热路径上的协程抖动。同步调用也提供了天然的背压。
 func (ac *AcFunLive) callEvent(t eventType, i any) {
 	ac.handlerMap.RLock()
-	defer ac.handlerMap.RUnlock()
 	list, ok := ac.handlerMap.listMap[t]
-	if ok {
-		for _, f := range list {
-			go func(f eventHandler) {
-				defer func() {
-					if err := recover(); err != nil {
-						log.Printf("dispatchEvent() %v goroutine error: %v", t, err)
-					}
-				}()
-				f(ac, i)
-			}(f)
-		}
+	if !ok {
+		ac.handlerMap.RUnlock()
+		return
 	}
+	if len(list) == 1 {
+		f := list[0]
+		ac.handlerMap.RUnlock()
+		callEventHandler(t, f, ac, i)
+		return
+	}
+	// 多个 handler 时仍并发派发，保证并行语义
+	ac.handlerMap.RUnlock()
+	for _, f := range list {
+		go func(f eventHandler) {
+			callEventHandler(t, f, ac, i)
+		}(f)
+	}
+}
+
+// callEventHandler 安全调用单个事件 handler，捕获其 panic 避免影响主流程
+func callEventHandler(t eventType, f eventHandler, ac *AcFunLive, i any) {
+	defer func() {
+		if err := recover(); err != nil {
+			log.Printf("dispatchEvent() %v goroutine error: %v", t, err)
+		}
+	}()
+	f(ac, i)
 }
 
 // OnDanmuStop 处理获取弹幕结束，有可能是网络原因导致连接超时无法获取弹幕，直播不一定结束，可以多次调用

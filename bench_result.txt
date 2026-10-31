@@ -1,8 +1,9 @@
 goos: linux
 goarch: amd64
 pkg: github.com/orzogc/acfundanmu
-cpu: AMD EPYC 9K65 192-Core Processor               
-BenchmarkHandleActionSignal-5   	  500000	     25756 ns/op	   37512 B/op	     515 allocs/op
-BenchmarkGzipDecode_Old-5       	  500000	     15288 ns/op	   58640 B/op	      13 allocs/op
-BenchmarkGzipDecode_New-5       	  500000	      6392 ns/op	   17464 B/op	       8 allocs/op
+cpu: AMD EPYC 9K65 192-Core Processor
+BenchmarkHandleActionSignal-5   	   62485	     37712 ns/op	   36376 B/op	     509 allocs/op
+BenchmarkGzipDecode_Old-5       	   86230	     28649 ns/op	   58640 B/op	      13 allocs/op
+BenchmarkGzipDecode_New-5       	  525675	      4384 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCallEvent_Single-5     	144401107	        16.54 ns/op	       0 B/op	       0 allocs/op
 PASS

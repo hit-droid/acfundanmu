@@ -6,12 +6,12 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"io"
 	"log"
 	"slices"
 	"sync"
 
 	"github.com/orzogc/acfundanmu/acproto"
+	"github.com/valyala/bytebufferpool"
 
 	"google.golang.org/protobuf/proto"
 )
@@ -23,14 +23,34 @@ var gzipReaderPool = sync.Pool{
 	},
 }
 
-// decompressGzip 解压 GZIP 数据，复用 gzip.Reader 以减少内存分配
-func decompressGzip(data []byte) ([]byte, error) {
+// gzipBytesReaderPool 复用 bytes.Reader，避免每次解压都重新分配读取器
+var gzipBytesReaderPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Reader)
+	},
+}
+
+// decompressGzip 解压 GZIP 数据，复用 gzip.Reader、bytes.Reader 与输出缓冲（bytebufferpool），
+// 几乎消除解压路径上的内存分配，显著降低高弹幕量下的 GC 压力。
+// 返回的 *bytebufferpool.ByteBuffer 由调用方在消费完其中的字节（如 proto.Unmarshal 之后）后
+// 通过 bytebufferpool.Put 归还，不得长期持有。
+func decompressGzip(data []byte) (*bytebufferpool.ByteBuffer, error) {
 	gr := gzipReaderPool.Get().(*gzip.Reader)
 	defer gzipReaderPool.Put(gr)
-	if err := gr.Reset(bytes.NewReader(data)); err != nil {
+
+	reader := gzipBytesReaderPool.Get().(*bytes.Reader)
+	reader.Reset(data)
+	defer gzipBytesReaderPool.Put(reader)
+
+	if err := gr.Reset(reader); err != nil {
 		return nil, err
 	}
-	return io.ReadAll(gr)
+	bb := bytebufferpool.Get()
+	if _, err := bb.ReadFrom(gr); err != nil {
+		bytebufferpool.Put(bb)
+		return nil, err
+	}
+	return bb, nil
 }
 
 // 处理接受到的数据里的命令
@@ -113,9 +133,12 @@ func (ac *AcFunLive) handleCommand(ctx context.Context, stream *acproto.Downstre
 		err = proto.Unmarshal(stream.PayloadData, message)
 		checkErr(err)
 		payload := message.Payload
+		var gzBuf *bytebufferpool.ByteBuffer
 		if message.CompressionType == acproto.ZtLiveScMessage_GZIP {
-			payload, err = decompressGzip(message.Payload)
-			checkErr(err)
+			bb, gerr := decompressGzip(message.Payload)
+			checkErr(gerr)
+			gzBuf = bb
+			payload = bb.Bytes()
 		}
 		switch message.MessageType {
 		case "ZtLiveScActionSignal":
@@ -144,6 +167,10 @@ func (ac *AcFunLive) handleCommand(ctx context.Context, stream *acproto.Downstre
 				message.MessageType,
 				string(payload),
 				base64.StdEncoding.EncodeToString(payload))
+		}
+		// 归还 gzip 解压复用的缓冲（handleActionSignal 等已消费其中的字节，不会长期持有）
+		if gzBuf != nil {
+			bytebufferpool.Put(gzBuf)
 		}
 	// AcFun 帐号收到的私信信息
 	case "Push.Message":
@@ -176,7 +203,8 @@ func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 	err := proto.Unmarshal(*payload, actionSignal)
 	checkErr(err)
 
-	var danmu []DanmuMessage
+	// 按 item 数量预分配，避免 append 过程中的多次扩容与再分配
+	danmu := make([]DanmuMessage, 0, len(actionSignal.Item))
 	for _, item := range actionSignal.Item {
 		for _, pl := range item.Payload {
 			switch item.SignalType {
