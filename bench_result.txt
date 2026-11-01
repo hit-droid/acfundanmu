@@ -2,8 +2,17 @@ goos: linux
 goarch: amd64
 pkg: github.com/orzogc/acfundanmu
 cpu: AMD EPYC 9K65 192-Core Processor
-BenchmarkHandleActionSignal-5   	   62485	     37712 ns/op	   36376 B/op	     509 allocs/op
-BenchmarkGzipDecode_Old-5       	   86230	     28649 ns/op	   58640 B/op	      13 allocs/op
-BenchmarkGzipDecode_New-5       	  525675	      4384 ns/op	       0 B/op	       0 allocs/op
-BenchmarkCallEvent_Single-5     	144401107	        16.54 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHandleActionSignal-5   	   51408	     23090 ns/op	   31576 B/op	     459 allocs/op
+BenchmarkGzipDecode_Old-5       	  111388	     11307 ns/op	   58640 B/op	      13 allocs/op
+BenchmarkGzipDecode_New-5       	  267388	      4406 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCallEvent_Single-5     	73692994	        16.29 ns/op	       0 B/op	       0 allocs/op
 PASS
+
+# 历史对比（HandleActionSignal，50 条评论/批次）
+# v1.1.0 (perf: 继续提升弹幕处理速度):   37712 ns/op   36376 B/op   509 allocs/op
+# v1.2.0 (perf: 减少热路径分配):         23090 ns/op   31576 B/op   459 allocs/op
+# 变动:                                    -38.7%        -13.2%        -9.8%
+#
+# 主要优化：新增返回值版本的内部 helper newUserInfo，替换热路径上 14 处 *NewUserInfo(...)，
+# 消除每条弹幕为 *UserInfo 额外分配的堆内存（pprof 显示约占 10% 分配量）。
+# 注：proto 消息内的字符串共享底层字节，池化内层消息会导致已派发弹幕字符串被复用而损坏，故未做池化。

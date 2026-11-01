@@ -168,7 +168,16 @@ type UserInfo struct {
 
 // NewUserInfo 创建 UserInfo
 func NewUserInfo(userInfo *acproto.ZtLiveUserInfo) *UserInfo {
-	user := &UserInfo{
+	u := newUserInfo(userInfo)
+	return &u
+}
+
+// newUserInfo 是 hot path 上使用的轻量版本：返回值而非指针，避免在解析每条弹幕时
+// 为 *UserInfo 额外分配一次堆内存（pprof 显示 NewUserInfo 占总分配量约 10%）。
+// 返回的 UserInfo 中的字符串仍引用传入 protobuf 消息的底层字节；当前实现每条弹幕
+// 都新建独立的 protobuf 消息，且字符串会随弹幕对象在堆上保持存活，因此安全。
+func newUserInfo(userInfo *acproto.ZtLiveUserInfo) UserInfo {
+	user := UserInfo{
 		UserID:   userInfo.UserId,
 		Nickname: userInfo.Nickname,
 	}

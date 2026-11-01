@@ -215,7 +215,7 @@ func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 				d := &Comment{
 					DanmuCommon: DanmuCommon{
 						SendTime: comment.SendTimeMs,
-						UserInfo: *NewUserInfo(comment.UserInfo),
+						UserInfo: newUserInfo(comment.UserInfo),
 					},
 					Content: comment.Content,
 				}
@@ -226,7 +226,7 @@ func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 				checkErr(err)
 				d := &Like{
 					SendTime: like.SendTimeMs,
-					UserInfo: *NewUserInfo(like.UserInfo),
+					UserInfo: newUserInfo(like.UserInfo),
 				}
 				danmu = append(danmu, d)
 			case "CommonActionSignalUserEnterRoom":
@@ -235,7 +235,7 @@ func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 				checkErr(err)
 				d := &EnterRoom{
 					SendTime: enter.SendTimeMs,
-					UserInfo: *NewUserInfo(enter.UserInfo),
+					UserInfo: newUserInfo(enter.UserInfo),
 				}
 				danmu = append(danmu, d)
 			case "CommonActionSignalUserFollowAuthor":
@@ -244,7 +244,7 @@ func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 				checkErr(err)
 				d := &FollowAuthor{
 					SendTime: follow.SendTimeMs,
-					UserInfo: *NewUserInfo(follow.UserInfo),
+					UserInfo: newUserInfo(follow.UserInfo),
 				}
 				danmu = append(danmu, d)
 			case "AcfunActionSignalThrowBanana":
@@ -294,7 +294,7 @@ func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 				d := &Gift{
 					DanmuCommon: DanmuCommon{
 						SendTime: gift.SendTimeMs,
-						UserInfo: *NewUserInfo(gift.UserInfo),
+						UserInfo: newUserInfo(gift.UserInfo),
 					},
 					GiftDetail:          g,
 					Count:               gift.BatchSize,
@@ -334,7 +334,7 @@ func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 					switch segment := segment.Segment.(type) {
 					case *acproto.CommonActionSignalRichText_RichTextSegment_UserInfo:
 						userInfo := &RichTextUserInfo{
-							UserInfo: *NewUserInfo(segment.UserInfo.User),
+							UserInfo: newUserInfo(segment.UserInfo.User),
 							Color:    segment.UserInfo.Color,
 						}
 						d.Segments[i] = userInfo
@@ -382,7 +382,7 @@ func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 				d := &ShareLive{
 					DanmuCommon: DanmuCommon{
 						SendTime: share.SendTimeMs,
-						UserInfo: *NewUserInfo(share.UserInfo),
+						UserInfo: newUserInfo(share.UserInfo),
 					},
 					SharePlatform:     SharePlatformType(share.SharePlatformId),
 					SharePlatformIcon: share.SharePlatformIcon,
@@ -475,7 +475,7 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			users := make([]TopUser, len(topUsers.User))
 			for i, user := range topUsers.User {
 				u := TopUser{
-					UserInfo:          *NewUserInfo(user.UserInfo),
+					UserInfo:          newUserInfo(user.UserInfo),
 					AnonymousUser:     user.AnonymousUser,
 					DisplaySendAmount: user.DisplaySendAmount,
 					CustomData:        user.CustomWatchingListData,
@@ -498,7 +498,7 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 				d := Comment{
 					DanmuCommon: DanmuCommon{
 						SendTime: comment.SendTimeMs,
-						UserInfo: *NewUserInfo(comment.UserInfo),
+						UserInfo: newUserInfo(comment.UserInfo),
 					},
 					Content: comment.Content,
 				}
@@ -518,7 +518,7 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			redpacks := make([]Redpack, len(redpackList.Redpacks))
 			for i, redpack := range redpackList.Redpacks {
 				r := Redpack{
-					UserInfo:           *NewUserInfo(redpack.Sender),
+					UserInfo:           newUserInfo(redpack.Sender),
 					DisplayStatus:      RedpackDisplayStatus(redpack.DisplayStatus),
 					GrabBeginTime:      redpack.GrabBeginTimeMs,
 					GetTokenLatestTime: redpack.GetTokenLatestTimeMs,
@@ -565,7 +565,7 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			if event {
 				ac.callEvent(chatReadyEvent, &ChatReady{
 					ChatID:    chatReady.ChatId,
-					Guest:     *NewUserInfo(chatReady.GuestUserInfo),
+					Guest:     newUserInfo(chatReady.GuestUserInfo),
 					MediaType: ChatMediaType(chatReady.MediaType),
 				})
 			}
@@ -587,7 +587,7 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			if event {
 				ac.callEvent(authorChatCallEvent, &AuthorChatCall{
 					Inviter: AuthorChatPlayerInfo{
-						UserInfo:               *NewUserInfo(chatCall.InviterUserInfo.Player),
+						UserInfo:               newUserInfo(chatCall.InviterUserInfo.Player),
 						LiveID:                 chatCall.InviterUserInfo.LiveId,
 						EnableJumpPeerLiveRoom: chatCall.InviterUserInfo.EnableJumpPeerLiveRoom,
 					},
@@ -612,12 +612,12 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			if event {
 				ac.callEvent(authorChatReadyEvent, &AuthorChatReady{
 					Inviter: AuthorChatPlayerInfo{
-						UserInfo:               *NewUserInfo(chatReady.InviterUserInfo.Player),
+						UserInfo:               newUserInfo(chatReady.InviterUserInfo.Player),
 						LiveID:                 chatReady.InviterUserInfo.LiveId,
 						EnableJumpPeerLiveRoom: chatReady.InviterUserInfo.EnableJumpPeerLiveRoom,
 					},
 					Invitee: AuthorChatPlayerInfo{
-						UserInfo:               *NewUserInfo(chatReady.InviteeUserInfo.Player),
+						UserInfo:               newUserInfo(chatReady.InviteeUserInfo.Player),
 						LiveID:                 chatReady.InviteeUserInfo.LiveId,
 						EnableJumpPeerLiveRoom: chatReady.InviteeUserInfo.EnableJumpPeerLiveRoom,
 					},
