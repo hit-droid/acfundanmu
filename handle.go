@@ -30,6 +30,72 @@ var gzipBytesReaderPool = sync.Pool{
 	},
 }
 
+// getProto 从 sync.Pool 取一个复用的 protobuf 消息对象。
+// proto.Unmarshal 在反序列化前会先 Reset 该消息，因此复用外层消息是安全的；
+// 反序列化产生的字符串均为 proto 内部拷贝（不引用输入缓冲），提取到弹幕对象后即可归还。
+func getProto[T proto.Message](p *sync.Pool) T {
+	return p.Get().(T)
+}
+
+// putProto 将复用的 protobuf 消息对象 Reset 后归还到池中，及时释放其持有的字符串引用以利于 GC。
+func putProto(p *sync.Pool, m proto.Message) {
+	proto.Reset(m)
+	p.Put(m)
+}
+
+// 热路径上复用的 protobuf 消息对象池。每条弹幕都会新建对应的 signal 消息，
+// 池化可消除反复分配这些结构体带来的堆分配与 GC 压力。
+var (
+	// handleCommand 入站消息
+	scMessagePool = &sync.Pool{New: func() any { return new(acproto.ZtLiveScMessage) }}
+
+	// handleActionSignal
+	actionSignalPool = &sync.Pool{New: func() any { return new(acproto.ZtLiveScActionSignal) }}
+	commentMsgPool   = &sync.Pool{New: func() any { return new(acproto.CommonActionSignalComment) }}
+	likeMsgPool      = &sync.Pool{New: func() any { return new(acproto.CommonActionSignalLike) }}
+	enterRoomMsgPool = &sync.Pool{New: func() any { return new(acproto.CommonActionSignalUserEnterRoom) }}
+	followMsgPool    = &sync.Pool{New: func() any { return new(acproto.CommonActionSignalUserFollowAuthor) }}
+	bananaMsgPool    = &sync.Pool{New: func() any { return new(acproto.AcfunActionSignalThrowBanana) }}
+	giftMsgPool      = &sync.Pool{New: func() any { return new(acproto.CommonActionSignalGift) }}
+	richTextMsgPool  = &sync.Pool{New: func() any { return new(acproto.CommonActionSignalRichText) }}
+	joinClubMsgPool  = &sync.Pool{New: func() any { return new(acproto.AcfunActionSignalJoinClub) }}
+	shareLiveMsgPool = &sync.Pool{New: func() any { return new(acproto.CommonActionSignalUserShareLive) }}
+
+	// handleStateSignal
+	stateSignalPool           = &sync.Pool{New: func() any { return new(acproto.ZtLiveScStateSignal) }}
+	stateDisplayInfoPool      = &sync.Pool{New: func() any { return new(acproto.CommonStateSignalDisplayInfo) }}
+	stateTopUsersPool         = &sync.Pool{New: func() any { return new(acproto.CommonStateSignalTopUsers) }}
+	stateRecentCommentPool    = &sync.Pool{New: func() any { return new(acproto.CommonStateSignalRecentComment) }}
+	stateRedpackListPool      = &sync.Pool{New: func() any { return new(acproto.CommonStateSignalCurrentRedpackList) }}
+	stateChatCallPool         = &sync.Pool{New: func() any { return new(acproto.CommonStateSignalChatCall) }}
+	stateChatAcceptPool       = &sync.Pool{New: func() any { return new(acproto.CommonStateSignalChatAccept) }}
+	stateChatReadyPool        = &sync.Pool{New: func() any { return new(acproto.CommonStateSignalChatReady) }}
+	stateChatEndPool          = &sync.Pool{New: func() any { return new(acproto.CommonStateSignalChatEnd) }}
+	stateAuthorChatCallPool   = &sync.Pool{New: func() any { return new(acproto.CommonStateSignalAuthorChatCall) }}
+	stateAuthorChatAcceptPool = &sync.Pool{New: func() any { return new(acproto.CommonStateSignalAuthorChatAccept) }}
+	stateAuthorChatReadyPool  = &sync.Pool{New: func() any { return new(acproto.CommonStateSignalAuthorChatReady) }}
+	stateAuthorChatEndPool    = &sync.Pool{New: func() any { return new(acproto.CommonStateSignalAuthorChatEnd) }}
+	stateAuthorChatSoundPool  = &sync.Pool{New: func() any { return new(acproto.CommonStateSignalAuthorChatChangeSoundConfig) }}
+	stateLiveStatePool        = &sync.Pool{New: func() any { return new(acproto.CommonStateSignalLiveState) }}
+
+	// handleNotifySignal
+	notifySignalPool       = &sync.Pool{New: func() any { return new(acproto.ZtLiveScNotifySignal) }}
+	notifyKickedOutPool    = &sync.Pool{New: func() any { return new(acproto.CommonNotifySignalKickedOut) }}
+	notifyViolationPool    = &sync.Pool{New: func() any { return new(acproto.CommonNotifySignalViolationAlert) }}
+	notifyManagerStatePool = &sync.Pool{New: func() any { return new(acproto.CommonNotifySignalLiveManagerState) }}
+)
+
+// danmuSlicePool 复用弹幕结果切片（[]DanmuMessage）的底层数组，避免每个批次都重新分配。
+// 切片元素均为指针，归还后仍由队列/事件持有，不会与切片底层数组产生别名冲突。
+// 仅回收容量不超过上限的切片，避免偶发超大批次长期占用内存。
+var danmuSlicePool = sync.Pool{
+	New: func() any {
+		return make([]DanmuMessage, 0, 64)
+	},
+}
+
+const maxPooledDanmuCap = 4096
+
 // decompressGzip 解压 GZIP 数据，复用 gzip.Reader、bytes.Reader 与输出缓冲（bytebufferpool），
 // 几乎消除解压路径上的内存分配，显著降低高弹幕量下的 GC 压力。
 // 返回的 *bytebufferpool.ByteBuffer 由调用方在消费完其中的字节（如 proto.Unmarshal 之后）后
@@ -129,7 +195,8 @@ func (ac *AcFunLive) handleCommand(ctx context.Context, stream *acproto.Downstre
 	case "Push.ZtLiveInteractive.Message":
 		_, err := ac.danmuClient.Write(ac.t.pushMessage())
 		checkErr(err)
-		message := &acproto.ZtLiveScMessage{}
+		message := getProto[*acproto.ZtLiveScMessage](scMessagePool)
+		defer putProto(scMessagePool, message)
 		err = proto.Unmarshal(stream.PayloadData, message)
 		checkErr(err)
 		payload := message.Payload
@@ -199,17 +266,24 @@ func (ac *AcFunLive) handleCommand(ctx context.Context, stream *acproto.Downstre
 
 // 处理 action signal 数据
 func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
-	actionSignal := &acproto.ZtLiveScActionSignal{}
+	actionSignal := getProto[*acproto.ZtLiveScActionSignal](actionSignalPool)
+	defer putProto(actionSignalPool, actionSignal)
 	err := proto.Unmarshal(*payload, actionSignal)
 	checkErr(err)
 
-	// 按 item 数量预分配，避免 append 过程中的多次扩容与再分配
-	danmu := make([]DanmuMessage, 0, len(actionSignal.Item))
+	// 复用弹幕结果切片，避免每个批次都重新分配底层数组
+	danmu := danmuSlicePool.Get().([]DanmuMessage)
+	danmu = danmu[:0]
+	defer func() {
+		if cap(danmu) <= maxPooledDanmuCap {
+			danmuSlicePool.Put(danmu)
+		}
+	}()
 	for _, item := range actionSignal.Item {
 		for _, pl := range item.Payload {
 			switch item.SignalType {
 			case "CommonActionSignalComment":
-				comment := &acproto.CommonActionSignalComment{}
+				comment := getProto[*acproto.CommonActionSignalComment](commentMsgPool)
 				err = proto.Unmarshal(pl, comment)
 				checkErr(err)
 				d := &Comment{
@@ -219,36 +293,40 @@ func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 					},
 					Content: comment.Content,
 				}
+				putProto(commentMsgPool, comment)
 				danmu = append(danmu, d)
 			case "CommonActionSignalLike":
-				like := &acproto.CommonActionSignalLike{}
+				like := getProto[*acproto.CommonActionSignalLike](likeMsgPool)
 				err = proto.Unmarshal(pl, like)
 				checkErr(err)
 				d := &Like{
 					SendTime: like.SendTimeMs,
 					UserInfo: newUserInfo(like.UserInfo),
 				}
+				putProto(likeMsgPool, like)
 				danmu = append(danmu, d)
 			case "CommonActionSignalUserEnterRoom":
-				enter := &acproto.CommonActionSignalUserEnterRoom{}
+				enter := getProto[*acproto.CommonActionSignalUserEnterRoom](enterRoomMsgPool)
 				err = proto.Unmarshal(pl, enter)
 				checkErr(err)
 				d := &EnterRoom{
 					SendTime: enter.SendTimeMs,
 					UserInfo: newUserInfo(enter.UserInfo),
 				}
+				putProto(enterRoomMsgPool, enter)
 				danmu = append(danmu, d)
 			case "CommonActionSignalUserFollowAuthor":
-				follow := &acproto.CommonActionSignalUserFollowAuthor{}
+				follow := getProto[*acproto.CommonActionSignalUserFollowAuthor](followMsgPool)
 				err = proto.Unmarshal(pl, follow)
 				checkErr(err)
 				d := &FollowAuthor{
 					SendTime: follow.SendTimeMs,
 					UserInfo: newUserInfo(follow.UserInfo),
 				}
+				putProto(followMsgPool, follow)
 				danmu = append(danmu, d)
 			case "AcfunActionSignalThrowBanana":
-				banana := &acproto.AcfunActionSignalThrowBanana{}
+				banana := getProto[*acproto.AcfunActionSignalThrowBanana](bananaMsgPool)
 				err = proto.Unmarshal(pl, banana)
 				checkErr(err)
 				d := &ThrowBanana{
@@ -261,9 +339,10 @@ func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 					},
 					BananaCount: int(banana.Count),
 				}
+				putProto(bananaMsgPool, banana)
 				danmu = append(danmu, d)
 			case "CommonActionSignalGift":
-				gift := &acproto.CommonActionSignalGift{}
+				gift := getProto[*acproto.CommonActionSignalGift](giftMsgPool)
 				err = proto.Unmarshal(pl, gift)
 				checkErr(err)
 				ac.t.giftsMutex.RLock()
@@ -321,9 +400,10 @@ func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 						}
 					}
 				}
+				putProto(giftMsgPool, gift)
 				danmu = append(danmu, d)
 			case "CommonActionSignalRichText":
-				richText := &acproto.CommonActionSignalRichText{}
+				richText := getProto[*acproto.CommonActionSignalRichText](richTextMsgPool)
 				err = proto.Unmarshal(pl, richText)
 				checkErr(err)
 				d := &RichText{
@@ -358,9 +438,10 @@ func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 						log.Println("出现未处理的 RichText Segment")
 					}
 				}
+				putProto(richTextMsgPool, richText)
 				danmu = append(danmu, d)
 			case "AcfunActionSignalJoinClub":
-				join := &acproto.AcfunActionSignalJoinClub{}
+				join := getProto[*acproto.AcfunActionSignalJoinClub](joinClubMsgPool)
 				err = proto.Unmarshal(pl, join)
 				checkErr(err)
 				d := &JoinClub{
@@ -374,9 +455,10 @@ func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 						Nickname: join.UperInfo.Name,
 					},
 				}
+				putProto(joinClubMsgPool, join)
 				danmu = append(danmu, d)
 			case "CommonActionSignalUserShareLive":
-				share := &acproto.CommonActionSignalUserShareLive{}
+				share := getProto[*acproto.CommonActionSignalUserShareLive](shareLiveMsgPool)
 				err = proto.Unmarshal(pl, share)
 				checkErr(err)
 				d := &ShareLive{
@@ -387,6 +469,7 @@ func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 					SharePlatform:     SharePlatformType(share.SharePlatformId),
 					SharePlatformIcon: share.SharePlatformIcon,
 				}
+				putProto(shareLiveMsgPool, share)
 				danmu = append(danmu, d)
 			default:
 				log.Printf("未知的Action Signal item.SignalType：%s\npayload string:\n%s\npayload base64:\n%s\n",
@@ -435,14 +518,16 @@ func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 
 // 处理 state signal 数据
 func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
-	stateSignal := &acproto.ZtLiveScStateSignal{}
+	stateSignal := getProto[*acproto.ZtLiveScStateSignal](stateSignalPool)
+	defer putProto(stateSignalPool, stateSignal)
 	err := proto.Unmarshal(*payload, stateSignal)
 	checkErr(err)
 
 	for _, item := range stateSignal.Item {
 		switch item.SignalType {
 		case "AcfunStateSignalDisplayInfo":
-			bananaInfo := &acproto.AcfunStateSignalDisplayInfo{}
+			bananaInfo := getProto[*acproto.AcfunStateSignalDisplayInfo](stateDisplayInfoPool)
+			defer putProto(stateDisplayInfoPool, bananaInfo)
 			err = proto.Unmarshal(item.Payload, bananaInfo)
 			checkErr(err)
 			if event {
@@ -453,7 +538,8 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 				ac.info.Unlock()
 			}
 		case "CommonStateSignalDisplayInfo":
-			stateInfo := &acproto.CommonStateSignalDisplayInfo{}
+			stateInfo := getProto[*acproto.CommonStateSignalDisplayInfo](stateDisplayInfoPool)
+			defer putProto(stateDisplayInfoPool, stateInfo)
 			err = proto.Unmarshal(item.Payload, stateInfo)
 			checkErr(err)
 			info := DisplayInfo{
@@ -469,7 +555,8 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 				ac.info.Unlock()
 			}
 		case "CommonStateSignalTopUsers":
-			topUsers := &acproto.CommonStateSignalTopUsers{}
+			topUsers := getProto[*acproto.CommonStateSignalTopUsers](stateTopUsersPool)
+			defer putProto(stateTopUsersPool, topUsers)
 			err = proto.Unmarshal(item.Payload, topUsers)
 			checkErr(err)
 			users := make([]TopUser, len(topUsers.User))
@@ -490,7 +577,8 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 				ac.info.Unlock()
 			}
 		case "CommonStateSignalRecentComment":
-			comments := &acproto.CommonStateSignalRecentComment{}
+			comments := getProto[*acproto.CommonStateSignalRecentComment](stateRecentCommentPool)
+			defer putProto(stateRecentCommentPool, comments)
 			err = proto.Unmarshal(item.Payload, comments)
 			checkErr(err)
 			danmu := make([]Comment, len(comments.Comment))
@@ -512,7 +600,8 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 				ac.info.Unlock()
 			}
 		case "CommonStateSignalCurrentRedpackList":
-			redpackList := &acproto.CommonStateSignalCurrentRedpackList{}
+			redpackList := getProto[*acproto.CommonStateSignalCurrentRedpackList](stateRedpackListPool)
+			defer putProto(stateRedpackListPool, redpackList)
 			err = proto.Unmarshal(item.Payload, redpackList)
 			checkErr(err)
 			redpacks := make([]Redpack, len(redpackList.Redpacks))
@@ -537,7 +626,8 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 				ac.info.Unlock()
 			}
 		case "CommonStateSignalChatCall":
-			chatCall := &acproto.CommonStateSignalChatCall{}
+			chatCall := getProto[*acproto.CommonStateSignalChatCall](stateChatCallPool)
+			defer putProto(stateChatCallPool, chatCall)
 			err = proto.Unmarshal(item.Payload, chatCall)
 			checkErr(err)
 			if event {
@@ -548,7 +638,8 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 				})
 			}
 		case "CommonStateSignalChatAccept":
-			chatAccept := &acproto.CommonStateSignalChatAccept{}
+			chatAccept := getProto[*acproto.CommonStateSignalChatAccept](stateChatAcceptPool)
+			defer putProto(stateChatAcceptPool, chatAccept)
 			err = proto.Unmarshal(item.Payload, chatAccept)
 			checkErr(err)
 			if event {
@@ -559,7 +650,8 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 				})
 			}
 		case "CommonStateSignalChatReady":
-			chatReady := &acproto.CommonStateSignalChatReady{}
+			chatReady := getProto[*acproto.CommonStateSignalChatReady](stateChatReadyPool)
+			defer putProto(stateChatReadyPool, chatReady)
 			err = proto.Unmarshal(item.Payload, chatReady)
 			checkErr(err)
 			if event {
@@ -570,7 +662,8 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 				})
 			}
 		case "CommonStateSignalChatEnd":
-			chatEnd := &acproto.CommonStateSignalChatEnd{}
+			chatEnd := getProto[*acproto.CommonStateSignalChatEnd](stateChatEndPool)
+			defer putProto(stateChatEndPool, chatEnd)
 			err = proto.Unmarshal(item.Payload, chatEnd)
 			checkErr(err)
 			if event {
@@ -581,7 +674,8 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			}
 		//case "AuthorChatPlayerInfo":
 		case "CommonStateSignalAuthorChatCall":
-			chatCall := &acproto.CommonStateSignalAuthorChatCall{}
+			chatCall := getProto[*acproto.CommonStateSignalAuthorChatCall](stateAuthorChatCallPool)
+			defer putProto(stateAuthorChatCallPool, chatCall)
 			err = proto.Unmarshal(item.Payload, chatCall)
 			checkErr(err)
 			if event {
@@ -596,7 +690,8 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 				})
 			}
 		case "CommonStateSignalAuthorChatAccept":
-			chatAccept := &acproto.CommonStateSignalAuthorChatAccept{}
+			chatAccept := getProto[*acproto.CommonStateSignalAuthorChatAccept](stateAuthorChatAcceptPool)
+			defer putProto(stateAuthorChatAcceptPool, chatAccept)
 			err = proto.Unmarshal(item.Payload, chatAccept)
 			checkErr(err)
 			if event {
@@ -606,7 +701,8 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 				})
 			}
 		case "CommonStateSignalAuthorChatReady":
-			chatReady := &acproto.CommonStateSignalAuthorChatReady{}
+			chatReady := getProto[*acproto.CommonStateSignalAuthorChatReady](stateAuthorChatReadyPool)
+			defer putProto(stateAuthorChatReadyPool, chatReady)
 			err = proto.Unmarshal(item.Payload, chatReady)
 			checkErr(err)
 			if event {
@@ -625,7 +721,8 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 				})
 			}
 		case "CommonStateSignalAuthorChatEnd":
-			chatEnd := &acproto.CommonStateSignalAuthorChatEnd{}
+			chatEnd := getProto[*acproto.CommonStateSignalAuthorChatEnd](stateAuthorChatEndPool)
+			defer putProto(stateAuthorChatEndPool, chatEnd)
 			err = proto.Unmarshal(item.Payload, chatEnd)
 			checkErr(err)
 			if event {
@@ -636,7 +733,8 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 				})
 			}
 		case "CommonStateSignalAuthorChatChangeSoundConfig":
-			soundConfig := &acproto.CommonStateSignalAuthorChatChangeSoundConfig{}
+			soundConfig := getProto[*acproto.CommonStateSignalAuthorChatChangeSoundConfig](stateAuthorChatSoundPool)
+			defer putProto(stateAuthorChatSoundPool, soundConfig)
 			err = proto.Unmarshal(item.Payload, soundConfig)
 			checkErr(err)
 			if event {
@@ -646,7 +744,8 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 				})
 			}
 		case "CommonStateSignalLiveState":
-			liveState := &acproto.CommonStateSignalLiveState{}
+			liveState := getProto[*acproto.CommonStateSignalLiveState](stateLiveStatePool)
+			defer putProto(stateLiveStatePool, liveState)
 			err = proto.Unmarshal(item.Payload, liveState)
 			checkErr(err)
 			if event {
