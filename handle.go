@@ -779,13 +779,15 @@ func danmuLess(a, b DanmuMessage) int {
 
 // 处理 notify signal 数据
 func (ac *AcFunLive) handleNotifySignal(payload *[]byte, event bool) {
-	notifySignal := &acproto.ZtLiveScNotifySignal{}
+	notifySignal := getProto[*acproto.ZtLiveScNotifySignal](notifySignalPool)
+	defer putProto(notifySignalPool, notifySignal)
 	err := proto.Unmarshal(*payload, notifySignal)
 	checkErr(err)
 	for _, item := range notifySignal.Item {
 		switch item.SignalType {
 		case "CommonNotifySignalKickedOut":
-			kickedOut := &acproto.CommonNotifySignalKickedOut{}
+			kickedOut := getProto[*acproto.CommonNotifySignalKickedOut](notifyKickedOutPool)
+			defer putProto(notifyKickedOutPool, kickedOut)
 			err = proto.Unmarshal(item.Payload, kickedOut)
 			checkErr(err)
 			if event {
@@ -796,7 +798,8 @@ func (ac *AcFunLive) handleNotifySignal(payload *[]byte, event bool) {
 				ac.info.Unlock()
 			}
 		case "CommonNotifySignalViolationAlert":
-			violationAlert := &acproto.CommonNotifySignalViolationAlert{}
+			violationAlert := getProto[*acproto.CommonNotifySignalViolationAlert](notifyViolationPool)
+			defer putProto(notifyViolationPool, violationAlert)
 			err = proto.Unmarshal(item.Payload, violationAlert)
 			checkErr(err)
 			if event {
@@ -807,7 +810,8 @@ func (ac *AcFunLive) handleNotifySignal(payload *[]byte, event bool) {
 				ac.info.Unlock()
 			}
 		case "CommonNotifySignalLiveManagerState":
-			liveManagerState := &acproto.CommonNotifySignalLiveManagerState{}
+			liveManagerState := getProto[*acproto.CommonNotifySignalLiveManagerState](notifyManagerStatePool)
+			defer putProto(notifyManagerStatePool, liveManagerState)
 			err = proto.Unmarshal(item.Payload, liveManagerState)
 			checkErr(err)
 			if event {

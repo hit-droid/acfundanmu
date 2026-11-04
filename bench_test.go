@@ -53,7 +53,6 @@ func gzippedActionSignal(n int) []byte {
 func newBenchAc() *AcFunLive {
 	ac := &AcFunLive{}
 	ac.handlerMap = new(handlerMap)
-	ac.handlerMap.listMap = make(map[eventType][]eventHandler)
 	return ac
 }
 

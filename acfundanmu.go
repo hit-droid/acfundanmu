@@ -10,7 +10,6 @@ import (
 	"github.com/orzogc/acfundanmu/acproto"
 	"github.com/segmentio/encoding/json"
 	"github.com/valyala/fasthttp"
-	"github.com/valyala/fastjson"
 )
 
 // 弹幕队列长度
@@ -190,24 +189,22 @@ func newUserInfo(userInfo *acproto.ZtLiveUserInfo) UserInfo {
 		p := medalParserPool.Get()
 		defer medalParserPool.Put(p)
 		v, err := p.Parse(userInfo.Badge)
-		if err == nil {
-			o := v.GetObject("medalInfo")
-			o.Visit(func(k []byte, v *fastjson.Value) {
-				switch string(k) {
-				case "uperId":
-					user.Medal.UperID = v.GetInt64()
-				case "userId":
-					user.Medal.UserID = v.GetInt64()
-				case "clubName":
-					user.Medal.ClubName = string(v.GetStringBytes())
-				case "level":
-					user.Medal.Level = v.GetInt()
-				default:
-					log.Printf("守护徽章里出现未处理的key和value：%s %s", string(k), string(v.MarshalTo([]byte{})))
-				}
-			})
-		} else {
+		if err != nil {
 			log.Printf("分析守护徽章的json数据出现错误：%v", err)
+		} else if o := v.GetObject("medalInfo"); o != nil {
+			// 直接按字段取值，避免 Visit 闭包在每条弹幕上的堆分配（徽章是热路径上的常见字段）
+			if val := o.Get("uperId"); val != nil {
+				user.Medal.UperID = val.GetInt64()
+			}
+			if val := o.Get("userId"); val != nil {
+				user.Medal.UserID = val.GetInt64()
+			}
+			if val := o.Get("clubName"); val != nil {
+				user.Medal.ClubName = string(val.GetStringBytes())
+			}
+			if val := o.Get("level"); val != nil {
+				user.Medal.Level = val.GetInt()
+			}
 		}
 	}
 
@@ -578,7 +575,6 @@ func NewAcFunLive(options ...Option) (ac *AcFunLive, err error) {
 	ac.t = new(token)
 	ac.t.livePage = liveHost
 	ac.handlerMap = new(handlerMap)
-	ac.handlerMap.listMap = make(map[eventType][]eventHandler)
 
 	for _, option := range options {
 		option(ac)
@@ -619,13 +615,24 @@ func (ac *AcFunLive) SetLiverUID(uid int64) (newAC *AcFunLive, err error) {
 
 // CopyEventHandlers 弹幕获取采用事件响应模式时复制 anotherAC 的事件处理函数到 ac
 func (ac *AcFunLive) CopyEventHandlers(anotherAC *AcFunLive) {
-	anotherAC.handlerMap.RLock()
-	defer anotherAC.handlerMap.RUnlock()
-	ac.handlerMap.Lock()
-	defer ac.handlerMap.Unlock()
-	for k, v := range anotherAC.handlerMap.listMap {
-		ac.handlerMap.listMap[k] = v
+	srcSnap := anotherAC.handlerMap.snap.Load()
+	if srcSnap == nil {
+		return
 	}
+	ac.handlerMap.mu.Lock()
+	defer ac.handlerMap.mu.Unlock()
+	var base map[eventType][]eventHandler
+	if cur := ac.handlerMap.snap.Load(); cur != nil {
+		base = cur.listMap
+	}
+	nm := make(map[eventType][]eventHandler, len(base)+len(srcSnap.listMap))
+	for k, v := range base {
+		nm[k] = v
+	}
+	for k, v := range srcSnap.listMap {
+		nm[k] = v // anotherAC 的事件处理函数覆盖 ac 的
+	}
+	ac.handlerMap.snap.Store(&handlerSnapshot{listMap: nm})
 }
 
 // StartDanmu 获取弹幕，ctx 用来结束弹幕的获取，event 为 true 时采用事件响应模式。

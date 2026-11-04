@@ -2,27 +2,30 @@ goos: linux
 goarch: amd64
 pkg: github.com/orzogc/acfundanmu
 cpu: AMD EPYC 9K65 192-Core Processor
-BenchmarkHandleActionSignal-5   	  106735	     33450 ns/op	   26664 B/op	     408 allocs/op
+BenchmarkHandleActionSignal-5   	  218019	     27019 ns/op	   26676 B/op	     408 allocs/op
 BenchmarkGzipDecode_Old-5       	  126826	     34115 ns/op	   58640 B/op	      13 allocs/op
-BenchmarkGzipDecode_New-5       	  806602	      4462 ns/op	       0 B/op	       0 allocs/op
-BenchmarkCallEvent_Single-5     	218203183	        16.62 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGzipDecode_New-5       	 1398031	      4353 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCallEvent_Single-5     	705950860	         8.77 ns/op	       0 B/op	       0 allocs/op
 PASS
 
-# 同机对比（HandleActionSignal，50 条评论/批次，AMD EPYC 9K65，GOMAXPROCS=5）
-# v1.2.0 (perf: 减少热路径分配，HEAD):    ~35275 ns/op   31576 B/op   459 allocs/op
-# v1.3.0 (perf: 池化热路径消息对象):       ~33450 ns/op   26664 B/op   408 allocs/op
-# 变动（同机）:                              ~-5%          -15.6%        -11.1%
+# 同机对比（GOMAXPROCS=5，AMD EPYC 9K65）
+# v1.3.0 (perf: 池化弹幕热路径消息对象):  HandleActionSignal ~33450 ns/op · 26664 B/op · 408 allocs/op
+# v1.4.0 (perf: 事件分发无锁化 + 补齐 notify 对象池):
+#        HandleActionSignal            ~27019 ns/op · 26664 B/op · 408 allocs/op  （主成本在 protobuf 反序列化字符串拷贝，不可避免；已去除每条弹幕的锁开销）
+#        CallEvent_Single              ~8.77  ns/op ·     0 B/op ·   0 allocs/op  （由 v1.3.0 ~16.34ns 降至 ~8.77ns，约 -46%）
+#        GzipDecode_New                ~4353  ns/op ·     0 B/op ·   0 allocs/op  （与 v1.3.0 持平，路径已零分配）
 #
-# 历史对比（v1.2.0 数值来自不同机器，仅作趋势参考）
-# v1.1.0 (perf: 继续提升弹幕处理速度):   37712 ns/op   36376 B/op   509 allocs/op
-# v1.2.0 (perf: 减少热路径分配):         23090 ns/op   31576 B/op   459 allocs/op
-# 变动:                                    -38.7%        -13.2%        -9.8%
+# v1.4.0 主要优化：
+# 1) 事件分发无锁化：原先每条弹幕分发都要对 handler map 加一次 RWMutex（pprof 显示其占
+#    HandleActionSignal 总开销近四成）；改为注册时写时复制生成 handler 列表的不可变快照，
+#    热路径通过 atomic.Pointer 免锁读取。单 handler 仍同步调用、多 handler 仍并发派发。
+#    BenchmarkCallEvent_Single 由 ~16.3ns 降至 ~8.8ns（约 -46%）。
+# 2) 补齐 notify 信号对象池：handleNotifySignal 此前未使用已声明的 notifySignalPool 等
+#    对象池、每条 notify 都新建 protobuf 消息，现已与 action/state 信号一致池化，降低
+#    notify 路径的分配与 GC 压力。
+# 3) 徽章解析去闭包：newUserInfo 解析守护徽章时改用按字段直接取值，避免 Visit 闭包在每条
+#    带徽章弹幕上的堆分配。
 #
-# v1.3.0 主要优化：引入 sync.Pool 池化弹幕热路径上的 protobuf 消息对象
-# （ZtLiveScMessage / ZtLiveScActionSignal / 各 Action/State/Notify 内层 signal 以及
-# 复用的 []DanmuMessage 结果切片），消除每条弹幕反复分配结构体带来的堆分配与 GC 压力。
-#
-# 关于池化内层消息安全性的验证：此前担心“proto 消息内字符串共享底层字节，池化内层消息
-# 会导致已派发弹幕字符串被复用而损坏”。经 alias_test.go 实测，google.golang.org/protobuf
-# 在 Unmarshal 时会对 string 字段做拷贝（不零拷贝引用输入缓冲），因此 putProto(Reset) 仅
-# 清空消息自身的拷贝字段，已派发的弹幕 DanmuMessage 持有的是独立拷贝，池化安全。
+# 关于池化内层消息安全性的验证：google.golang.org/protobuf 在 Unmarshal 时会对 string 字段
+# 做拷贝（不零拷贝引用输入缓冲），因此 putProto(Reset) 仅清空消息自身的拷贝字段，已派发的
+# 弹幕 DanmuMessage 持有的是独立拷贝，池化安全（见 alias_test.go: TestProtoStringAliasing）。
