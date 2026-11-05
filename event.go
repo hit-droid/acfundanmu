@@ -73,13 +73,10 @@ func (h *handlerMap) add(t eventType, f eventHandler) {
 	h.snap.Store(&handlerSnapshot{listMap: nm})
 }
 
-// callEvent 调用 t 对应的事件 handler。热路径上通过 atomic 快照无锁读取 handler 列表：
-// 原先每条弹幕都为此付出一次 RWMutex 读写锁的代价（pprof 显示其占 HandleActionSignal
-// 总开销的近四成）；改为快照后读取完全免锁。
-// 仅有一个 handler 时直接同步调用（不新起协程，无协程抖动、提供天然背压）；
-// 有多个 handler 时才并发派发，保留并行语义。
-func (ac *AcFunLive) callEvent(t eventType, i any) {
-	snap := ac.handlerMap.snap.Load()
+// dispatchEvent 使用调用方已加载的 handler 快照调用 t 对应的事件 handler。
+// 在弹幕热路径（逐条弹幕分发）上，调用方应只加载一次快照并复用本函数，
+// 避免每条弹幕都 atomic 读取快照、重复 map 查找，降低事件分发开销。
+func (ac *AcFunLive) dispatchEvent(snap *handlerSnapshot, t eventType, i any) {
 	if snap == nil {
 		return
 	}
@@ -97,6 +94,15 @@ func (ac *AcFunLive) callEvent(t eventType, i any) {
 			callEventHandler(t, f, ac, i)
 		}(f)
 	}
+}
+
+// callEvent 调用 t 对应的事件 handler。热路径上通过 atomic 快照无锁读取 handler 列表：
+// 原先每条弹幕都为此付出一次 RWMutex 读写锁的代价（pprof 显示其占 HandleActionSignal
+// 总开销的近四成）；改为快照后读取完全免锁。
+// 仅有一个 handler 时直接同步调用（不新起协程，无协程抖动、提供天然背压）；
+// 有多个 handler 时才并发派发，保留并行语义。
+func (ac *AcFunLive) callEvent(t eventType, i any) {
+	ac.dispatchEvent(ac.handlerMap.snap.Load(), t, i)
 }
 
 // callEventHandler 安全调用单个事件 handler，捕获其 panic 避免影响主流程

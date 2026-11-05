@@ -2,30 +2,44 @@ goos: linux
 goarch: amd64
 pkg: github.com/orzogc/acfundanmu
 cpu: AMD EPYC 9K65 192-Core Processor
-BenchmarkHandleActionSignal-5   	  218019	     27019 ns/op	   26676 B/op	     408 allocs/op
-BenchmarkGzipDecode_Old-5       	  126826	     34115 ns/op	   58640 B/op	      13 allocs/op
-BenchmarkGzipDecode_New-5       	 1398031	      4353 ns/op	       0 B/op	       0 allocs/op
-BenchmarkCallEvent_Single-5     	705950860	         8.77 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHandleActionSignal-5   	  200000	     19091 ns/op	   19454 B/op	     358 allocs/op
+BenchmarkGzipDecode_Old-5       	  200000	     29328 ns/op	   58640 B/op	      13 allocs/op
+BenchmarkGzipDecode_New-5       	  200000	      4449 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCallEvent_Single-5     	  200000	         9.35 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHandleStateSignal-5    	  200000	     17084 ns/op	   10220 B/op	     307 allocs/op
+BenchmarkHandleNotifySignal-5   	  200000	     14890 ns/op	    9020 B/op	     257 allocs/op
 PASS
 
-# 同机对比（GOMAXPROCS=5，AMD EPYC 9K65）
-# v1.3.0 (perf: 池化弹幕热路径消息对象):  HandleActionSignal ~33450 ns/op · 26664 B/op · 408 allocs/op
+# 同机对比（GOMAXPROCS=5，AMD EPYC 9K65，v1.5.0 三跑稳定区间 19091–19834 ns/op）
 # v1.4.0 (perf: 事件分发无锁化 + 补齐 notify 对象池):
-#        HandleActionSignal            ~27019 ns/op · 26664 B/op · 408 allocs/op  （主成本在 protobuf 反序列化字符串拷贝，不可避免；已去除每条弹幕的锁开销）
-#        CallEvent_Single              ~8.77  ns/op ·     0 B/op ·   0 allocs/op  （由 v1.3.0 ~16.34ns 降至 ~8.77ns，约 -46%）
-#        GzipDecode_New                ~4353  ns/op ·     0 B/op ·   0 allocs/op  （与 v1.3.0 持平，路径已零分配）
+#        HandleActionSignal            ~27019 ns/op · 26664 B/op · 408 allocs/op
+# v1.5.0 (perf: 评论热路径零嵌套分配轻量解析 + 事件分发快照去冗余 + state/notify 池化归还):
+#        HandleActionSignal            ~19300 ns/op · 19454 B/op · 358 allocs/op
+#            （较 v1.4.0：耗时约 -29%、内存约 -27%、分配次数约 -12%；每批次少 50 次嵌套消息 reflect.New）
+#        CallEvent_Single              ~9.4   ns/op ·     0 B/op ·   0 allocs/op  （与 v1.4.0 持平，无锁分发已达标）
+#        GzipDecode_New                ~4450  ns/op ·     0 B/op ·   0 allocs/op  （与 v1.4.0 持平，解压路径已零分配）
+#        HandleStateSignal             ~17000 ns/op · 10220 B/op · 307 allocs/op  （新增基准；多 item 间复用同一池对象）
+#        HandleNotifySignal            ~14900 ns/op ·  9020 B/op · 257 allocs/op  （新增基准；同上）
 #
-# v1.4.0 主要优化：
-# 1) 事件分发无锁化：原先每条弹幕分发都要对 handler map 加一次 RWMutex（pprof 显示其占
-#    HandleActionSignal 总开销近四成）；改为注册时写时复制生成 handler 列表的不可变快照，
-#    热路径通过 atomic.Pointer 免锁读取。单 handler 仍同步调用、多 handler 仍并发派发。
-#    BenchmarkCallEvent_Single 由 ~16.3ns 降至 ~8.8ns（约 -46%）。
-# 2) 补齐 notify 信号对象池：handleNotifySignal 此前未使用已声明的 notifySignalPool 等
-#    对象池、每条 notify 都新建 protobuf 消息，现已与 action/state 信号一致池化，降低
-#    notify 路径的分配与 GC 压力。
-# 3) 徽章解析去闭包：newUserInfo 解析守护徽章时改用按字段直接取值，避免 Visit 闭包在每条
-#    带徽章弹幕上的堆分配。
+# v1.5.0 主要优化：
+# 1) 评论热路径零嵌套分配轻量解析：原先每条评论都用标准 proto.Unmarshal 反序列化
+#    CommonActionSignalComment，其间会 reflect.New 出 ZtLiveUserInfo / ZtLiveUserIdentity /
+#    ImageCdnNode 等嵌套消息（pprof 显示该部分占 HandleActionSignal 分配量近四成）。
+#    新增 fastdecode.go 仅提取业务所需字段（content / sendTimeMs / userId / nickname /
+#    avatar[0].url / badge / managerType），不再构造任何嵌套 protobuf 消息。
+#    parseCommentFast 遇到任何非预期编码一律返回 ok=false，由 handleActionSignal 回退到
+#    标准 proto.Unmarshal，因此行为正确性不被破坏（见 fastdecode_test.go 的对照测试，
+#    快速路径与标准路径逐项比对完全一致）。
+# 2) 事件分发快照去冗余：handleActionSignal 的逐条分发循环原先每条弹幕都 atomic.Load 一次
+#    handler 快照并重复 map 查找；改为在批次开始时只加载一次快照并复用 dispatchEvent，
+#    减少热路径上的原子读与查找开销。
+# 3) newUserInfo 惰性取解析器：仅当存在徽章时才从 medalParserPool 借用/归还解析器，
+#    无徽章的弹幕（绝大多数）省去一次 sync.Pool 往返与 defer 开销。
+# 4) state/notify 对象池归还修复：handleStateSignal / handleNotifySignal 原先在 per-item
+#    循环内用 defer putProto，导致对象在整个信号处理结束前无法在 item 间复用、且带来循环内
+#    defer 开销；改为每条 item 用完即还，多 item 间可复用同一池对象，并消除 defer 开销。
+# 5) 健壮性：修复 newUserInfo(nil) 的潜在空指针 panic（部分不含 userInfo 字段的构造消息会触发）。
 #
 # 关于池化内层消息安全性的验证：google.golang.org/protobuf 在 Unmarshal 时会对 string 字段
-# 做拷贝（不零拷贝引用输入缓冲），因此 putProto(Reset) 仅清空消息自身的拷贝字段，已派发的
-# 弹幕 DanmuMessage 持有的是独立拷贝，池化安全（见 alias_test.go: TestProtoStringAliasing）。
+# 做拷贝（不零拷贝引用输入缓冲），快速路径同样通过 string(b[a:b]) 显式拷贝，已派发的弹幕
+# DanmuMessage 持有独立拷贝，池化与复用均安全（见 alias_test.go: TestProtoStringAliasing）。

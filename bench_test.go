@@ -123,3 +123,75 @@ func BenchmarkCallEvent_Single(b *testing.B) {
 		ac.callEvent(commentDanmu, comment)
 	}
 }
+
+// rawStateSignal 返回包含 n 条 CommonStateSignalDisplayInfo 的 state signal 原始 protobuf 字节
+func rawStateSignal(n int) []byte {
+	state := &acproto.ZtLiveScStateSignal{}
+	for i := 0; i < n; i++ {
+		display := &acproto.CommonStateSignalDisplayInfo{
+			WatchingCount: "12345",
+			LikeCount:     "678",
+			LikeDelta:     int32(i),
+		}
+		b, err := proto.Marshal(display)
+		if err != nil {
+			panic(err)
+		}
+		state.Item = append(state.Item, &acproto.ZtLiveStateSignalItem{
+			SignalType: "CommonStateSignalDisplayInfo",
+			Payload:    b,
+		})
+	}
+	raw, err := proto.Marshal(state)
+	if err != nil {
+		panic(err)
+	}
+	return raw
+}
+
+// rawNotifySignal 返回包含 n 条 CommonNotifySignalKickedOut 的 notify signal 原始 protobuf 字节
+func rawNotifySignal(n int) []byte {
+	notify := &acproto.ZtLiveScNotifySignal{}
+	for i := 0; i < n; i++ {
+		kicked := &acproto.CommonNotifySignalKickedOut{Reason: "test reason"}
+		b, err := proto.Marshal(kicked)
+		if err != nil {
+			panic(err)
+		}
+		notify.Item = append(notify.Item, &acproto.ZtLiveNotifySignalItem{
+			SignalType: "CommonNotifySignalKickedOut",
+			Payload:    b,
+		})
+	}
+	raw, err := proto.Marshal(notify)
+	if err != nil {
+		panic(err)
+	}
+	return raw
+}
+
+// BenchmarkHandleStateSignal 测量 state signal 的解析耗时（多 item，复用对象池）。
+// 优化前每条 item 都在循环内 defer putProto，对象池在该批次内无法复用且带来 defer 开销；
+// 优化后每条 item 用完即还，多 item 间可复用同一池对象、并消除循环内 defer 开销。
+func BenchmarkHandleStateSignal(b *testing.B) {
+	const n = 50
+	payload := rawStateSignal(n)
+	ac := newBenchAc()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ac.handleStateSignal(&payload, true)
+	}
+}
+
+// BenchmarkHandleNotifySignal 测量 notify signal 的解析耗时（多 item，复用对象池）。
+func BenchmarkHandleNotifySignal(b *testing.B) {
+	const n = 50
+	payload := rawNotifySignal(n)
+	ac := newBenchAc()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ac.handleNotifySignal(&payload, true)
+	}
+}

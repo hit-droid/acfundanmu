@@ -176,6 +176,11 @@ func NewUserInfo(userInfo *acproto.ZtLiveUserInfo) *UserInfo {
 // 返回的 UserInfo 中的字符串仍引用传入 protobuf 消息的底层字节；当前实现每条弹幕
 // 都新建独立的 protobuf 消息，且字符串会随弹幕对象在堆上保持存活，因此安全。
 func newUserInfo(userInfo *acproto.ZtLiveUserInfo) UserInfo {
+	// 部分弹幕（如某些状态的构造消息）可能不含 userInfo 字段，做空指针保护，
+	// 避免解析时 panic（原实现在此会直接解引用空指针）。
+	if userInfo == nil {
+		return UserInfo{}
+	}
 	user := UserInfo{
 		UserID:   userInfo.UserId,
 		Nickname: userInfo.Nickname,
@@ -185,28 +190,7 @@ func newUserInfo(userInfo *acproto.ZtLiveUserInfo) UserInfo {
 		user.Avatar = userInfo.Avatar[0].Url
 	}
 
-	if userInfo.Badge != "" {
-		p := medalParserPool.Get()
-		defer medalParserPool.Put(p)
-		v, err := p.Parse(userInfo.Badge)
-		if err != nil {
-			log.Printf("分析守护徽章的json数据出现错误：%v", err)
-		} else if o := v.GetObject("medalInfo"); o != nil {
-			// 直接按字段取值，避免 Visit 闭包在每条弹幕上的堆分配（徽章是热路径上的常见字段）
-			if val := o.Get("uperId"); val != nil {
-				user.Medal.UperID = val.GetInt64()
-			}
-			if val := o.Get("userId"); val != nil {
-				user.Medal.UserID = val.GetInt64()
-			}
-			if val := o.Get("clubName"); val != nil {
-				user.Medal.ClubName = string(val.GetStringBytes())
-			}
-			if val := o.Get("level"); val != nil {
-				user.Medal.Level = val.GetInt()
-			}
-		}
-	}
+	user.Medal = parseMedal(userInfo.Badge)
 
 	if userInfo.UserIdentity != nil {
 		user.ManagerType = ManagerType(userInfo.UserIdentity.ManagerType)
