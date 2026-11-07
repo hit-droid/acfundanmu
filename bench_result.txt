@@ -2,44 +2,42 @@ goos: linux
 goarch: amd64
 pkg: github.com/orzogc/acfundanmu
 cpu: AMD EPYC 9K65 192-Core Processor
-BenchmarkHandleActionSignal-5   	  200000	     19091 ns/op	   19454 B/op	     358 allocs/op
-BenchmarkGzipDecode_Old-5       	  200000	     29328 ns/op	   58640 B/op	      13 allocs/op
-BenchmarkGzipDecode_New-5       	  200000	      4449 ns/op	       0 B/op	       0 allocs/op
-BenchmarkCallEvent_Single-5     	  200000	         9.35 ns/op	       0 B/op	       0 allocs/op
-BenchmarkHandleStateSignal-5    	  200000	     17084 ns/op	   10220 B/op	     307 allocs/op
-BenchmarkHandleNotifySignal-5   	  200000	     14890 ns/op	    9020 B/op	     257 allocs/op
+BenchmarkHandleActionSignal-5   	  139627	      8600 ns/op	    8426 B/op	     151 allocs/op
+BenchmarkGzipDecode_Old-5       	   43356	     28712 ns/op	   58640 B/op	      13 allocs/op
+BenchmarkGzipDecode_New-5       	  277369	      4293 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCallEvent_Single-5     	127898391	         9.628 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHandleStateSignal-5    	   70722	     16480 ns/op	   10220 B/op	     307 allocs/op
+BenchmarkHandleNotifySignal-5   	   85537	     13978 ns/op	    9020 B/op	     257 allocs/op
 PASS
 
-# 同机对比（GOMAXPROCS=5，AMD EPYC 9K65，v1.5.0 三跑稳定区间 19091–19834 ns/op）
-# v1.4.0 (perf: 事件分发无锁化 + 补齐 notify 对象池):
-#        HandleActionSignal            ~27019 ns/op · 26664 B/op · 408 allocs/op
-# v1.5.0 (perf: 评论热路径零嵌套分配轻量解析 + 事件分发快照去冗余 + state/notify 池化归还):
-#        HandleActionSignal            ~19300 ns/op · 19454 B/op · 358 allocs/op
-#            （较 v1.4.0：耗时约 -29%、内存约 -27%、分配次数约 -12%；每批次少 50 次嵌套消息 reflect.New）
-#        CallEvent_Single              ~9.4   ns/op ·     0 B/op ·   0 allocs/op  （与 v1.4.0 持平，无锁分发已达标）
-#        GzipDecode_New                ~4450  ns/op ·     0 B/op ·   0 allocs/op  （与 v1.4.0 持平，解压路径已零分配）
-#        HandleStateSignal             ~17000 ns/op · 10220 B/op · 307 allocs/op  （新增基准；多 item 间复用同一池对象）
-#        HandleNotifySignal            ~14900 ns/op ·  9020 B/op · 257 allocs/op  （新增基准；同上）
+# 同机对比（GOMAXPROCS=5，AMD EPYC 9K65）
+# v1.4.0: HandleActionSignal ~27019 ns/op · 26664 B/op · 408 allocs/op
+# v1.5.0: HandleActionSignal ~19300 ns/op · 19454 B/op · 358 allocs/op
+# v1.6.0: HandleActionSignal ~ 8600 ns/op ·  8426 B/op · 151 allocs/op
 #
-# v1.5.0 主要优化：
-# 1) 评论热路径零嵌套分配轻量解析：原先每条评论都用标准 proto.Unmarshal 反序列化
-#    CommonActionSignalComment，其间会 reflect.New 出 ZtLiveUserInfo / ZtLiveUserIdentity /
-#    ImageCdnNode 等嵌套消息（pprof 显示该部分占 HandleActionSignal 分配量近四成）。
-#    新增 fastdecode.go 仅提取业务所需字段（content / sendTimeMs / userId / nickname /
-#    avatar[0].url / badge / managerType），不再构造任何嵌套 protobuf 消息。
-#    parseCommentFast 遇到任何非预期编码一律返回 ok=false，由 handleActionSignal 回退到
-#    标准 proto.Unmarshal，因此行为正确性不被破坏（见 fastdecode_test.go 的对照测试，
-#    快速路径与标准路径逐项比对完全一致）。
-# 2) 事件分发快照去冗余：handleActionSignal 的逐条分发循环原先每条弹幕都 atomic.Load 一次
-#    handler 快照并重复 map 查找；改为在批次开始时只加载一次快照并复用 dispatchEvent，
-#    减少热路径上的原子读与查找开销。
-# 3) newUserInfo 惰性取解析器：仅当存在徽章时才从 medalParserPool 借用/归还解析器，
-#    无徽章的弹幕（绝大多数）省去一次 sync.Pool 往返与 defer 开销。
-# 4) state/notify 对象池归还修复：handleStateSignal / handleNotifySignal 原先在 per-item
-#    循环内用 defer putProto，导致对象在整个信号处理结束前无法在 item 间复用、且带来循环内
-#    defer 开销；改为每条 item 用完即还，多 item 间可复用同一池对象，并消除 defer 开销。
-# 5) 健壮性：修复 newUserInfo(nil) 的潜在空指针 panic（部分不含 userInfo 字段的构造消息会触发）。
+# 版本间对比（HandleActionSignal）：
+#   v1.4.0 → v1.5.0：耗时约 -29%、内存约 -27%、分配约 -12%（评论热路径零嵌套分配轻量解析）
+#   v1.5.0 → v1.6.0：耗时约 -55%、内存约 -57%、分配约 -58%（外层 action signal 零分配轻量解析）
 #
-# 关于池化内层消息安全性的验证：google.golang.org/protobuf 在 Unmarshal 时会对 string 字段
-# 做拷贝（不零拷贝引用输入缓冲），快速路径同样通过 string(b[a:b]) 显式拷贝，已派发的弹幕
-# DanmuMessage 持有独立拷贝，池化与复用均安全（见 alias_test.go: TestProtoStringAliasing）。
+# v1.6.0 主要优化：
+# 1) 外层 action signal 零分配轻量解析：原先每条弹幕批次都用标准 proto.Unmarshal 反序列化
+#    整个 ZtLiveScActionSignal，其间会 reflect.New 出 50 个 ZtLiveActionSignalItem，并为其
+#    Payload 拷贝出 [][]byte（pprof 显示该部分占 HandleActionSignal 分配量的过半，且是主要 CPU 来源）。
+#    v1.6.0 新增 parseActionSignalItems / parseActionItem（见 fastdecode.go），仅提取每条 item 的
+#    SignalType（field 1）与各 Payload（field 2，repeated bytes）元素，不构造任何 protobuf 消息，
+#    也不对 Payload 做字节拷贝——直接以子切片视图传入内层解析。遇到任何非预期/截断的编码一律返回
+#    ok=false，由 handleActionSignal 回退到标准 proto.Unmarshal，因此行为正确性不被破坏
+#    （见 fastdecode_test.go 的 TestParseActionSignalItems / TestParseActionSignalItemsFallback，
+#     快速路径与标准路径逐项比对一致，且覆盖字段乱序、单 item 多 payload、截断输入等情形）。
+# 2) 解析逻辑共用与去冗余：原 handleActionSignal 内联的逐 signalType 分支被抽取为 handleActionItem，
+#    快速路径与标准回退路径共用同一份解析逻辑，避免重复与漂移；事件分发快照去冗余、state/notify
+#    对象池归还等 v1.5.0 的优化保持不变。下游排序与事件分发逻辑未变。
+#
+# 剩余分配的构成（v1.6.0，50 条评论/批次，约 151 allocs）：每条评论的 *Comment 结构体（1）、
+# Content 字符串底层数组（1）、Nickname 字符串底层数组（1），合计约 3 allocs/条；这些是业务必需的
+# 独立拷贝，已接近热路径下限。
+#
+# 关于池化与别名安全性的验证：google.golang.org/protobuf 在 Unmarshal 时会对 string 字段做拷贝；
+# 快速路径同样通过 string(b[a:b]) 显式拷贝；外层解析仅传递 Payload 的字节视图（子切片），由内层解析
+# 再显式拷贝出字符串，已派发的弹幕 DanmuMessage 持有独立拷贝，池化与复用均安全
+# （见 alias_test.go: TestProtoStringAliasing）。

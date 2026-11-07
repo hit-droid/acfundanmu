@@ -266,11 +266,6 @@ func (ac *AcFunLive) handleCommand(ctx context.Context, stream *acproto.Downstre
 
 // 处理 action signal 数据
 func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
-	actionSignal := getProto[*acproto.ZtLiveScActionSignal](actionSignalPool)
-	defer putProto(actionSignalPool, actionSignal)
-	err := proto.Unmarshal(*payload, actionSignal)
-	checkErr(err)
-
 	// 复用弹幕结果切片，避免每个批次都重新分配底层数组
 	danmu := danmuSlicePool.Get().([]DanmuMessage)
 	danmu = danmu[:0]
@@ -279,213 +274,15 @@ func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 			danmuSlicePool.Put(danmu)
 		}
 	}()
-	for _, item := range actionSignal.Item {
-		for _, pl := range item.Payload {
-			switch item.SignalType {
-			case "CommonActionSignalComment":
-				// 热路径优先用零嵌套分配的轻量解析（避免每条弹幕 reflect.New 嵌套消息），
-				// 遇到非预期编码时回退到标准 proto.Unmarshal，保证行为正确。
-				comment, ok := parseCommentFast(pl)
-				if !ok {
-					fc := getProto[*acproto.CommonActionSignalComment](commentMsgPool)
-					err = proto.Unmarshal(pl, fc)
-					if err != nil {
-						log.Printf("解析弹幕评论出现错误：%v", err)
-						continue
-					}
-					comment = &Comment{
-						DanmuCommon: DanmuCommon{
-							SendTime: fc.SendTimeMs,
-							UserInfo: newUserInfo(fc.UserInfo),
-						},
-						Content: fc.Content,
-					}
-					putProto(commentMsgPool, fc)
-				}
-				danmu = append(danmu, comment)
-			case "CommonActionSignalLike":
-				like := getProto[*acproto.CommonActionSignalLike](likeMsgPool)
-				err = proto.Unmarshal(pl, like)
-				checkErr(err)
-				d := &Like{
-					SendTime: like.SendTimeMs,
-					UserInfo: newUserInfo(like.UserInfo),
-				}
-				putProto(likeMsgPool, like)
-				danmu = append(danmu, d)
-			case "CommonActionSignalUserEnterRoom":
-				enter := getProto[*acproto.CommonActionSignalUserEnterRoom](enterRoomMsgPool)
-				err = proto.Unmarshal(pl, enter)
-				checkErr(err)
-				d := &EnterRoom{
-					SendTime: enter.SendTimeMs,
-					UserInfo: newUserInfo(enter.UserInfo),
-				}
-				putProto(enterRoomMsgPool, enter)
-				danmu = append(danmu, d)
-			case "CommonActionSignalUserFollowAuthor":
-				follow := getProto[*acproto.CommonActionSignalUserFollowAuthor](followMsgPool)
-				err = proto.Unmarshal(pl, follow)
-				checkErr(err)
-				d := &FollowAuthor{
-					SendTime: follow.SendTimeMs,
-					UserInfo: newUserInfo(follow.UserInfo),
-				}
-				putProto(followMsgPool, follow)
-				danmu = append(danmu, d)
-			case "AcfunActionSignalThrowBanana":
-				banana := getProto[*acproto.AcfunActionSignalThrowBanana](bananaMsgPool)
-				err = proto.Unmarshal(pl, banana)
-				checkErr(err)
-				d := &ThrowBanana{
-					DanmuCommon: DanmuCommon{
-						SendTime: banana.SendTimeMs,
-						UserInfo: UserInfo{
-							UserID:   banana.Visitor.UserId,
-							Nickname: banana.Visitor.Name,
-						},
-					},
-					BananaCount: int(banana.Count),
-				}
-				putProto(bananaMsgPool, banana)
-				danmu = append(danmu, d)
-			case "CommonActionSignalGift":
-				gift := getProto[*acproto.CommonActionSignalGift](giftMsgPool)
-				err = proto.Unmarshal(pl, gift)
-				checkErr(err)
-				ac.t.giftsMutex.RLock()
-				g, ok := ac.t.gifts[gift.GiftId]
-				ac.t.giftsMutex.RUnlock()
-				// 存在未知礼物时
-				if !ok {
-					list, err := ac.t.getGiftList(ac.t.liveID)
-					if err != nil {
-						log.Printf("获取礼物列表出现错误：%v", err)
-						g = GiftDetail{
-							GiftID:   gift.GiftId,
-							GiftName: "未知礼物",
-						}
-					} else {
-						ac.t.giftsMutex.Lock()
-						ac.t.gifts = list
-						g, ok = ac.t.gifts[gift.GiftId]
-						if !ok {
-							g = GiftDetail{
-								GiftID:   gift.GiftId,
-								GiftName: "未知礼物",
-							}
-						}
-						ac.t.giftsMutex.Unlock()
-					}
-				}
-				d := &Gift{
-					DanmuCommon: DanmuCommon{
-						SendTime: gift.SendTimeMs,
-						UserInfo: newUserInfo(gift.UserInfo),
-					},
-					GiftDetail:          g,
-					Count:               gift.BatchSize,
-					Combo:               gift.ComboCount,
-					Value:               gift.Rank,
-					ComboID:             gift.ComboKey,
-					SlotDisplayDuration: gift.SlotDisplayDurationMs,
-					ExpireDuration:      gift.ExpireDurationMs,
-				}
-				if gift.DrawGiftInfo != nil {
-					d.DrawGiftInfo = DrawGiftInfo{
-						ScreenWidth:  gift.DrawGiftInfo.ScreenWidth,
-						ScreenHeight: gift.DrawGiftInfo.ScreenHeight,
-					}
-					d.DrawGiftInfo.DrawPoint = make([]DrawPoint, len(gift.DrawGiftInfo.DrawPoint))
-					for i, drawPoint := range gift.DrawGiftInfo.DrawPoint {
-						d.DrawGiftInfo.DrawPoint[i] = DrawPoint{
-							MarginLeft:  drawPoint.MarginLeft,
-							MarginTop:   drawPoint.MarginTop,
-							ScaleRatio:  drawPoint.ScaleRatio,
-							Handup:      drawPoint.Handup,
-							PointWidth:  drawPoint.PointWidth,
-							PointHeight: drawPoint.PointHeight,
-						}
-					}
-				}
-				putProto(giftMsgPool, gift)
-				danmu = append(danmu, d)
-			case "CommonActionSignalRichText":
-				richText := getProto[*acproto.CommonActionSignalRichText](richTextMsgPool)
-				err = proto.Unmarshal(pl, richText)
-				checkErr(err)
-				d := &RichText{
-					SendTime: richText.SendTimeMs,
-				}
-				d.Segments = make([]RichTextSegment, len(richText.Segments))
-				for i, segment := range richText.Segments {
-					switch segment := segment.Segment.(type) {
-					case *acproto.CommonActionSignalRichText_RichTextSegment_UserInfo:
-						userInfo := &RichTextUserInfo{
-							UserInfo: newUserInfo(segment.UserInfo.User),
-							Color:    segment.UserInfo.Color,
-						}
-						d.Segments[i] = userInfo
-					case *acproto.CommonActionSignalRichText_RichTextSegment_Plain:
-						plain := &RichTextPlain{
-							Text:  segment.Plain.Text,
-							Color: segment.Plain.Color,
-						}
-						d.Segments[i] = plain
-					case *acproto.CommonActionSignalRichText_RichTextSegment_Image:
-						image := &RichTextImage{
-							AlternativeText:  segment.Image.AlternativeText,
-							AlternativeColor: segment.Image.AlternativeColor,
-						}
-						image.Pictures = make([]string, len(segment.Image.Pictures))
-						for j, picture := range segment.Image.Pictures {
-							image.Pictures[j] = picture.Url
-						}
-						d.Segments[i] = image
-					default:
-						log.Println("出现未处理的 RichText Segment")
-					}
-				}
-				putProto(richTextMsgPool, richText)
-				danmu = append(danmu, d)
-			case "AcfunActionSignalJoinClub":
-				join := getProto[*acproto.AcfunActionSignalJoinClub](joinClubMsgPool)
-				err = proto.Unmarshal(pl, join)
-				checkErr(err)
-				d := &JoinClub{
-					JoinTime: join.JoinTimeMs,
-					FansInfo: UserInfo{
-						UserID:   join.FansInfo.UserId,
-						Nickname: join.FansInfo.Name,
-					},
-					UperInfo: UserInfo{
-						UserID:   join.UperInfo.UserId,
-						Nickname: join.UperInfo.Name,
-					},
-				}
-				putProto(joinClubMsgPool, join)
-				danmu = append(danmu, d)
-			case "CommonActionSignalUserShareLive":
-				share := getProto[*acproto.CommonActionSignalUserShareLive](shareLiveMsgPool)
-				err = proto.Unmarshal(pl, share)
-				checkErr(err)
-				d := &ShareLive{
-					DanmuCommon: DanmuCommon{
-						SendTime: share.SendTimeMs,
-						UserInfo: newUserInfo(share.UserInfo),
-					},
-					SharePlatform:     SharePlatformType(share.SharePlatformId),
-					SharePlatformIcon: share.SharePlatformIcon,
-				}
-				putProto(shareLiveMsgPool, share)
-				danmu = append(danmu, d)
-			default:
-				log.Printf("未知的Action Signal item.SignalType：%s\npayload string:\n%s\npayload base64:\n%s\n",
-					item.SignalType,
-					string(pl),
-					base64.StdEncoding.EncodeToString(pl))
-			}
-		}
+
+	// 热路径优先用零分配的外层 action signal 轻量解析（避免每条弹幕都用标准
+	// proto.Unmarshal 反射创建 ZtLiveScActionSignal / ZtLiveActionSignalItem 及其
+	// Payload [][]byte 拷贝）。遇到非预期编码时回退到标准 proto.Unmarshal，保证行为正确。
+	if !parseActionSignalItems(*payload, func(sigType, pl []byte) {
+		ac.handleActionItem(&danmu, sigType, pl)
+	}) {
+		danmu = danmu[:0]
+		ac.handleActionSignalStandard(payload, &danmu)
 	}
 
 	// 按 SendTime 大小排序（上游通常已按时间有序，先检测可跳过排序以提速）
@@ -521,8 +318,232 @@ func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 				log.Println("出现未处理的 DanmuMessage")
 			}
 		} else {
-			err = ac.q.Put(d)
+			err := ac.q.Put(d)
 			checkErr(err)
+		}
+	}
+}
+
+// handleActionItem 解析单个 action signal 的 payload 为对应的弹幕消息并追加到 danmu 切片。
+// sigType 为 signalType 的字节视图（热路径上以 []byte 比对字面量、不分配），pl 为单条 payload 字节视图。
+// 快速路径（零分配外层解析）与标准路径（pool + proto.Unmarshal）共用本函数，避免逻辑重复。
+func (ac *AcFunLive) handleActionItem(danmu *[]DanmuMessage, sigType, pl []byte) {
+	switch {
+	case string(sigType) == "CommonActionSignalComment":
+		// 热路径优先用零嵌套分配的轻量解析（避免每条弹幕 reflect.New 嵌套消息），
+		// 遇到非预期编码时回退到标准 proto.Unmarshal，保证行为正确。
+		comment, ok := parseCommentFast(pl)
+		if !ok {
+			fc := getProto[*acproto.CommonActionSignalComment](commentMsgPool)
+			err := proto.Unmarshal(pl, fc)
+			if err != nil {
+				log.Printf("解析弹幕评论出现错误：%v", err)
+				return
+			}
+			comment = &Comment{
+				DanmuCommon: DanmuCommon{
+					SendTime: fc.SendTimeMs,
+					UserInfo: newUserInfo(fc.UserInfo),
+				},
+				Content: fc.Content,
+			}
+			putProto(commentMsgPool, fc)
+		}
+		*danmu = append(*danmu, comment)
+	case string(sigType) == "CommonActionSignalLike":
+		like := getProto[*acproto.CommonActionSignalLike](likeMsgPool)
+		err := proto.Unmarshal(pl, like)
+		checkErr(err)
+		d := &Like{
+			SendTime: like.SendTimeMs,
+			UserInfo: newUserInfo(like.UserInfo),
+		}
+		putProto(likeMsgPool, like)
+		*danmu = append(*danmu, d)
+	case string(sigType) == "CommonActionSignalUserEnterRoom":
+		enter := getProto[*acproto.CommonActionSignalUserEnterRoom](enterRoomMsgPool)
+		err := proto.Unmarshal(pl, enter)
+		checkErr(err)
+		d := &EnterRoom{
+			SendTime: enter.SendTimeMs,
+			UserInfo: newUserInfo(enter.UserInfo),
+		}
+		putProto(enterRoomMsgPool, enter)
+		*danmu = append(*danmu, d)
+	case string(sigType) == "CommonActionSignalUserFollowAuthor":
+		follow := getProto[*acproto.CommonActionSignalUserFollowAuthor](followMsgPool)
+		err := proto.Unmarshal(pl, follow)
+		checkErr(err)
+		d := &FollowAuthor{
+			SendTime: follow.SendTimeMs,
+			UserInfo: newUserInfo(follow.UserInfo),
+		}
+		putProto(followMsgPool, follow)
+		*danmu = append(*danmu, d)
+	case string(sigType) == "AcfunActionSignalThrowBanana":
+		banana := getProto[*acproto.AcfunActionSignalThrowBanana](bananaMsgPool)
+		err := proto.Unmarshal(pl, banana)
+		checkErr(err)
+		d := &ThrowBanana{
+			DanmuCommon: DanmuCommon{
+				SendTime: banana.SendTimeMs,
+				UserInfo: UserInfo{
+					UserID:   banana.Visitor.UserId,
+					Nickname: banana.Visitor.Name,
+				},
+			},
+			BananaCount: int(banana.Count),
+		}
+		putProto(bananaMsgPool, banana)
+		*danmu = append(*danmu, d)
+	case string(sigType) == "CommonActionSignalGift":
+		gift := getProto[*acproto.CommonActionSignalGift](giftMsgPool)
+		err := proto.Unmarshal(pl, gift)
+		checkErr(err)
+		ac.t.giftsMutex.RLock()
+		g, ok := ac.t.gifts[gift.GiftId]
+		ac.t.giftsMutex.RUnlock()
+		// 存在未知礼物时
+		if !ok {
+			list, gerr := ac.t.getGiftList(ac.t.liveID)
+			if gerr != nil {
+				log.Printf("获取礼物列表出现错误：%v", gerr)
+				g = GiftDetail{
+					GiftID:   gift.GiftId,
+					GiftName: "未知礼物",
+				}
+			} else {
+				ac.t.giftsMutex.Lock()
+				ac.t.gifts = list
+				g, ok = ac.t.gifts[gift.GiftId]
+				if !ok {
+					g = GiftDetail{
+						GiftID:   gift.GiftId,
+						GiftName: "未知礼物",
+					}
+				}
+				ac.t.giftsMutex.Unlock()
+			}
+		}
+		d := &Gift{
+			DanmuCommon: DanmuCommon{
+				SendTime: gift.SendTimeMs,
+				UserInfo: newUserInfo(gift.UserInfo),
+			},
+			GiftDetail:          g,
+			Count:               gift.BatchSize,
+			Combo:               gift.ComboCount,
+			Value:               gift.Rank,
+			ComboID:             gift.ComboKey,
+			SlotDisplayDuration: gift.SlotDisplayDurationMs,
+			ExpireDuration:      gift.ExpireDurationMs,
+		}
+		if gift.DrawGiftInfo != nil {
+			d.DrawGiftInfo = DrawGiftInfo{
+				ScreenWidth:  gift.DrawGiftInfo.ScreenWidth,
+				ScreenHeight: gift.DrawGiftInfo.ScreenHeight,
+			}
+			d.DrawGiftInfo.DrawPoint = make([]DrawPoint, len(gift.DrawGiftInfo.DrawPoint))
+			for i, drawPoint := range gift.DrawGiftInfo.DrawPoint {
+				d.DrawGiftInfo.DrawPoint[i] = DrawPoint{
+					MarginLeft:  drawPoint.MarginLeft,
+					MarginTop:   drawPoint.MarginTop,
+					ScaleRatio:  drawPoint.ScaleRatio,
+					Handup:      drawPoint.Handup,
+					PointWidth:  drawPoint.PointWidth,
+					PointHeight: drawPoint.PointHeight,
+				}
+			}
+		}
+		putProto(giftMsgPool, gift)
+		*danmu = append(*danmu, d)
+	case string(sigType) == "CommonActionSignalRichText":
+		richText := getProto[*acproto.CommonActionSignalRichText](richTextMsgPool)
+		err := proto.Unmarshal(pl, richText)
+		checkErr(err)
+		d := &RichText{
+			SendTime: richText.SendTimeMs,
+		}
+		d.Segments = make([]RichTextSegment, len(richText.Segments))
+		for i, segment := range richText.Segments {
+			switch segment := segment.Segment.(type) {
+			case *acproto.CommonActionSignalRichText_RichTextSegment_UserInfo:
+				userInfo := &RichTextUserInfo{
+					UserInfo: newUserInfo(segment.UserInfo.User),
+					Color:    segment.UserInfo.Color,
+				}
+				d.Segments[i] = userInfo
+			case *acproto.CommonActionSignalRichText_RichTextSegment_Plain:
+				plain := &RichTextPlain{
+					Text:  segment.Plain.Text,
+					Color: segment.Plain.Color,
+				}
+				d.Segments[i] = plain
+			case *acproto.CommonActionSignalRichText_RichTextSegment_Image:
+				image := &RichTextImage{
+					AlternativeText:  segment.Image.AlternativeText,
+					AlternativeColor: segment.Image.AlternativeColor,
+				}
+				image.Pictures = make([]string, len(segment.Image.Pictures))
+				for j, picture := range segment.Image.Pictures {
+					image.Pictures[j] = picture.Url
+				}
+				d.Segments[i] = image
+			default:
+				log.Println("出现未处理的 RichText Segment")
+			}
+		}
+		putProto(richTextMsgPool, richText)
+		*danmu = append(*danmu, d)
+	case string(sigType) == "AcfunActionSignalJoinClub":
+		join := getProto[*acproto.AcfunActionSignalJoinClub](joinClubMsgPool)
+		err := proto.Unmarshal(pl, join)
+		checkErr(err)
+		d := &JoinClub{
+			JoinTime: join.JoinTimeMs,
+			FansInfo: UserInfo{
+				UserID:   join.FansInfo.UserId,
+				Nickname: join.FansInfo.Name,
+			},
+			UperInfo: UserInfo{
+				UserID:   join.UperInfo.UserId,
+				Nickname: join.UperInfo.Name,
+			},
+		}
+		putProto(joinClubMsgPool, join)
+		*danmu = append(*danmu, d)
+	case string(sigType) == "CommonActionSignalUserShareLive":
+		share := getProto[*acproto.CommonActionSignalUserShareLive](shareLiveMsgPool)
+		err := proto.Unmarshal(pl, share)
+		checkErr(err)
+		d := &ShareLive{
+			DanmuCommon: DanmuCommon{
+				SendTime: share.SendTimeMs,
+				UserInfo: newUserInfo(share.UserInfo),
+			},
+			SharePlatform:     SharePlatformType(share.SharePlatformId),
+			SharePlatformIcon: share.SharePlatformIcon,
+		}
+		putProto(shareLiveMsgPool, share)
+		*danmu = append(*danmu, d)
+	default:
+		log.Printf("未知的Action Signal item.SignalType：%s\npayload string:\n%s\npayload base64:\n%s\n",
+			string(sigType),
+			string(pl),
+			base64.StdEncoding.EncodeToString(pl))
+	}
+}
+
+// handleActionSignalStandard 标准解析路径：用池化消息 + proto.Unmarshal 完整解析 action signal，
+// 仅在快速路径遇到非预期编码时作为回退调用，保证行为与历史版本完全一致。
+func (ac *AcFunLive) handleActionSignalStandard(payload *[]byte, danmu *[]DanmuMessage) {
+	actionSignal := getProto[*acproto.ZtLiveScActionSignal](actionSignalPool)
+	defer putProto(actionSignalPool, actionSignal)
+	err := proto.Unmarshal(*payload, actionSignal)
+	checkErr(err)
+	for _, item := range actionSignal.Item {
+		for _, pl := range item.Payload {
+			ac.handleActionItem(danmu, []byte(item.SignalType), pl)
 		}
 	}
 }

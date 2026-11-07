@@ -260,3 +260,87 @@ func parseManagerType(b []byte) (ManagerType, bool) {
 	}
 	return 0, true
 }
+
+// parseActionSignalItems 零分配遍历 ZtLiveScActionSignal 的 item，对每个 Payload 元素调用 fn。
+// 仅提取 SignalType（field 1）与各 Payload（field 2，repeated bytes）元素，不构造任何 protobuf 消息，
+// 从而消除标准 proto.Unmarshal 为每条 item 反射创建 ZtLiveActionSignalItem 及其 Payload [][]byte 拷贝的
+// 分配与 CPU 开销（pprof 显示该部分占 HandleActionSignal 分配量的过半）。
+// 遇到任何非预期/截断的编码一律返回 false，由调用方回退到标准 proto.Unmarshal，保证行为正确。
+func parseActionSignalItems(b []byte, fn func(sigType, pl []byte)) bool {
+	for len(b) > 0 {
+		tag, n := readVarint(b)
+		if n <= 0 {
+			return false
+		}
+		b = b[n:]
+		field := tag >> 3
+		wire := tag & 7
+		if field == 1 && wire == 2 { // item（repeated ZtLiveActionSignalItem，field 1）
+			v, n2 := readVarint(b)
+			if n2 <= 0 || uint64(len(b)-n2) < v {
+				return false
+			}
+			item := b[n2 : n2+int(v)]
+			b = b[n2+int(v):]
+			if !parseActionItem(item, fn) {
+				return false
+			}
+		} else {
+			rest, ok := skipField(b, wire)
+			if !ok {
+				return false
+			}
+			b = rest
+		}
+	}
+	return true
+}
+
+// parseActionItem 解析单个 ZtLiveActionSignalItem：提取 SignalType（field 1）与每个
+// Payload（field 2，repeated bytes），对每个 Payload 元素调用 fn(sigType, pl)。
+// 为兼容字段乱序（极少见），先用栈上缓冲暂存 Payload 元素，待 SignalType 确定后再派发，
+// 既避免额外堆分配，又保证乱序编码下不丢失弹幕。
+func parseActionItem(b []byte, fn func(sigType, pl []byte)) bool {
+	var sigType []byte
+	var payloads [4][]byte
+	np := 0
+	for len(b) > 0 {
+		tag, n := readVarint(b)
+		if n <= 0 {
+			return false
+		}
+		b = b[n:]
+		field := tag >> 3
+		wire := tag & 7
+		switch {
+		case field == 1 && wire == 2: // signalType
+			v, n2 := readVarint(b)
+			if n2 <= 0 || uint64(len(b)-n2) < v {
+				return false
+			}
+			sigType = b[n2 : n2+int(v)]
+			b = b[n2+int(v):]
+		case field == 2 && wire == 2: // payload（repeated bytes）
+			if np >= len(payloads) {
+				return false // 单 item 超过 4 个 payload 视为非预期编码，回退标准解析
+			}
+			v, n2 := readVarint(b)
+			if n2 <= 0 || uint64(len(b)-n2) < v {
+				return false
+			}
+			payloads[np] = b[n2 : n2+int(v)]
+			np++
+			b = b[n2+int(v):]
+		default:
+			rest, ok := skipField(b, wire)
+			if !ok {
+				return false
+			}
+			b = rest
+		}
+	}
+	for i := 0; i < np; i++ {
+		fn(sigType, payloads[i])
+	}
+	return true
+}
