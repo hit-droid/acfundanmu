@@ -68,6 +68,133 @@ func BenchmarkHandleActionSignal(b *testing.B) {
 	}
 }
 
+// rawSignalWithItems 把给定 item 列表拼装成完整的 ZtLiveScActionSignal 原始字节（未压缩）
+func rawSignalWithItems(items []*acproto.ZtLiveActionSignalItem) []byte {
+	action := &acproto.ZtLiveScActionSignal{Item: items}
+	raw, err := proto.Marshal(action)
+	if err != nil {
+		panic(err)
+	}
+	return raw
+}
+
+// rawLikeSignal 返回包含 n 条点赞信号的 action signal 原始 protobuf 字节
+func rawLikeSignal(n int) []byte {
+	items := make([]*acproto.ZtLiveActionSignalItem, n)
+	for i := 0; i < n; i++ {
+		b, err := proto.Marshal(&acproto.CommonActionSignalLike{
+			SendTimeMs: int64(i),
+			UserInfo:   &acproto.ZtLiveUserInfo{UserId: 123456, Nickname: "tester"},
+		})
+		if err != nil {
+			panic(err)
+		}
+		items[i] = &acproto.ZtLiveActionSignalItem{SignalType: "CommonActionSignalLike", Payload: [][]byte{b}}
+	}
+	return rawSignalWithItems(items)
+}
+
+// rawEnterRoomSignal 返回包含 n 条进房信号的 action signal 原始 protobuf 字节
+func rawEnterRoomSignal(n int) []byte {
+	items := make([]*acproto.ZtLiveActionSignalItem, n)
+	for i := 0; i < n; i++ {
+		b, err := proto.Marshal(&acproto.CommonActionSignalUserEnterRoom{
+			SendTimeMs: int64(i),
+			UserInfo:   &acproto.ZtLiveUserInfo{UserId: 123456, Nickname: "tester"},
+		})
+		if err != nil {
+			panic(err)
+		}
+		items[i] = &acproto.ZtLiveActionSignalItem{SignalType: "CommonActionSignalUserEnterRoom", Payload: [][]byte{b}}
+	}
+	return rawSignalWithItems(items)
+}
+
+// rawFollowSignal 返回包含 n 条关注信号的 action signal 原始 protobuf 字节
+func rawFollowSignal(n int) []byte {
+	items := make([]*acproto.ZtLiveActionSignalItem, n)
+	for i := 0; i < n; i++ {
+		b, err := proto.Marshal(&acproto.CommonActionSignalUserFollowAuthor{
+			SendTimeMs: int64(i),
+			UserInfo:   &acproto.ZtLiveUserInfo{UserId: 123456, Nickname: "tester"},
+		})
+		if err != nil {
+			panic(err)
+		}
+		items[i] = &acproto.ZtLiveActionSignalItem{SignalType: "CommonActionSignalUserFollowAuthor", Payload: [][]byte{b}}
+	}
+	return rawSignalWithItems(items)
+}
+
+// BenchmarkHandleActionSignal_Like 测量“点赞”热路径解析耗时。
+func BenchmarkHandleActionSignal_Like(b *testing.B) {
+	const n = 50
+	payload := rawLikeSignal(n)
+	ac := newBenchAc()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ac.handleActionSignal(&payload, true)
+	}
+}
+
+// BenchmarkHandleActionSignal_EnterRoom 测量“进房”热路径解析耗时。
+func BenchmarkHandleActionSignal_EnterRoom(b *testing.B) {
+	const n = 50
+	payload := rawEnterRoomSignal(n)
+	ac := newBenchAc()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ac.handleActionSignal(&payload, true)
+	}
+}
+
+// BenchmarkHandleActionSignal_Follow 测量“关注”热路径解析耗时。
+func BenchmarkHandleActionSignal_Follow(b *testing.B) {
+	const n = 50
+	payload := rawFollowSignal(n)
+	ac := newBenchAc()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ac.handleActionSignal(&payload, true)
+	}
+}
+
+// BenchmarkHandleActionSignal_Mixed 测量混合弹幕（评论+点赞+进房+关注）热路径解析耗时，
+// 更贴近真实直播流中多类型信号并发推送的情形。
+func BenchmarkHandleActionSignal_Mixed(b *testing.B) {
+	const nComment, nLike, nEnter, nFollow = 20, 15, 10, 5
+	items := make([]*acproto.ZtLiveActionSignalItem, 0, nComment+nLike+nEnter+nFollow)
+	add := func(sig string, m proto.Message) {
+		b2, err := proto.Marshal(m)
+		if err != nil {
+			panic(err)
+		}
+		items = append(items, &acproto.ZtLiveActionSignalItem{SignalType: sig, Payload: [][]byte{b2}})
+	}
+	for i := 0; i < nComment; i++ {
+		add("CommonActionSignalComment", &acproto.CommonActionSignalComment{SendTimeMs: int64(i), Content: "混合流弹幕", UserInfo: &acproto.ZtLiveUserInfo{UserId: 123456, Nickname: "tester"}})
+	}
+	for i := 0; i < nLike; i++ {
+		add("CommonActionSignalLike", &acproto.CommonActionSignalLike{SendTimeMs: int64(i), UserInfo: &acproto.ZtLiveUserInfo{UserId: 123456, Nickname: "tester"}})
+	}
+	for i := 0; i < nEnter; i++ {
+		add("CommonActionSignalUserEnterRoom", &acproto.CommonActionSignalUserEnterRoom{SendTimeMs: int64(i), UserInfo: &acproto.ZtLiveUserInfo{UserId: 123456, Nickname: "tester"}})
+	}
+	for i := 0; i < nFollow; i++ {
+		add("CommonActionSignalUserFollowAuthor", &acproto.CommonActionSignalUserFollowAuthor{SendTimeMs: int64(i), UserInfo: &acproto.ZtLiveUserInfo{UserId: 123456, Nickname: "tester"}})
+	}
+	payload := rawSignalWithItems(items)
+	ac := newBenchAc()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ac.handleActionSignal(&payload, true)
+	}
+}
+
 // gzipDecodeOld 旧实现：每条消息都新建 gzip.Reader
 func gzipDecodeOld(data []byte) ([]byte, error) {
 	r, err := gzip.NewReader(bytes.NewReader(data))

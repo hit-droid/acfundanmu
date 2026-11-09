@@ -261,6 +261,55 @@ func parseManagerType(b []byte) (ManagerType, bool) {
 	return 0, true
 }
 
+// parseSimpleUserSignalFast 以零嵌套分配解析 CommonActionSignalLike /
+// CommonActionSignalUserEnterRoom / CommonActionSignalUserFollowAuthor 这三种同构消息
+// （field 1 = userInfo 消息，field 2 = sendTimeMs varint），仅提取 SendTime 与 UserInfo，
+// 不构造任何嵌套 protobuf 消息，从而消除标准 proto.Unmarshal 为每条弹幕 reflect.New 出
+// ZtLiveUserInfo 及其 UserIdentity / Avatar 等嵌套消息带来的分配与 CPU 开销。
+// 任何非预期/截断的编码一律返回 (0, UserInfo{}, false)，由调用方回退到标准 proto.Unmarshal，
+// 保证行为正确（见 fastdecode_test.go 的 TestParseSimpleUserSignalMatchesStandard）。
+func parseSimpleUserSignalFast(pl []byte) (int64, UserInfo, bool) {
+	var ui UserInfo
+	var sendTime int64
+	for len(pl) > 0 {
+		tag, n := readVarint(pl)
+		if n <= 0 {
+			return 0, UserInfo{}, false
+		}
+		pl = pl[n:]
+		field := tag >> 3
+		wire := tag & 7
+		switch {
+		case field == 1 && wire == 2: // userInfo（ZtLiveUserInfo）
+			v, n2 := readVarint(pl)
+			if n2 <= 0 || uint64(len(pl)-n2) < v {
+				return 0, UserInfo{}, false
+			}
+			sub := pl[n2 : n2+int(v)]
+			pl = pl[n2+int(v):]
+			u, ok := parseUserInfoFast(sub)
+			if !ok {
+				return 0, UserInfo{}, false
+			}
+			ui = u
+		case field == 2 && wire == 0: // sendTimeMs
+			v, n2 := readVarint(pl)
+			if n2 <= 0 {
+				return 0, UserInfo{}, false
+			}
+			sendTime = int64(v)
+			pl = pl[n2:]
+		default:
+			rest, ok := skipField(pl, wire)
+			if !ok {
+				return 0, UserInfo{}, false
+			}
+			pl = rest
+		}
+	}
+	return sendTime, ui, true
+}
+
 // parseActionSignalItems 零分配遍历 ZtLiveScActionSignal 的 item，对每个 Payload 元素调用 fn。
 // 仅提取 SignalType（field 1）与各 Payload（field 2，repeated bytes）元素，不构造任何 protobuf 消息，
 // 从而消除标准 proto.Unmarshal 为每条 item 反射创建 ZtLiveActionSignalItem 及其 Payload [][]byte 拷贝的

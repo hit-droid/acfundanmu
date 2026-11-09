@@ -351,35 +351,52 @@ func (ac *AcFunLive) handleActionItem(danmu *[]DanmuMessage, sigType, pl []byte)
 		}
 		*danmu = append(*danmu, comment)
 	case string(sigType) == "CommonActionSignalLike":
-		like := getProto[*acproto.CommonActionSignalLike](likeMsgPool)
-		err := proto.Unmarshal(pl, like)
-		checkErr(err)
-		d := &Like{
-			SendTime: like.SendTimeMs,
-			UserInfo: newUserInfo(like.UserInfo),
+		// 热路径优先用零嵌套分配轻量解析（避免每条弹幕 reflect.New 出 ZtLiveUserInfo 等
+		// 嵌套消息）；遇到非预期编码时回退到标准 proto.Unmarshal，保证行为正确。
+		if sendTime, ui, ok := parseSimpleUserSignalFast(pl); ok {
+			d := &Like{SendTime: sendTime, UserInfo: ui}
+			*danmu = append(*danmu, d)
+		} else {
+			like := getProto[*acproto.CommonActionSignalLike](likeMsgPool)
+			err := proto.Unmarshal(pl, like)
+			checkErr(err)
+			d := &Like{
+				SendTime: like.SendTimeMs,
+				UserInfo: newUserInfo(like.UserInfo),
+			}
+			putProto(likeMsgPool, like)
+			*danmu = append(*danmu, d)
 		}
-		putProto(likeMsgPool, like)
-		*danmu = append(*danmu, d)
 	case string(sigType) == "CommonActionSignalUserEnterRoom":
-		enter := getProto[*acproto.CommonActionSignalUserEnterRoom](enterRoomMsgPool)
-		err := proto.Unmarshal(pl, enter)
-		checkErr(err)
-		d := &EnterRoom{
-			SendTime: enter.SendTimeMs,
-			UserInfo: newUserInfo(enter.UserInfo),
+		if sendTime, ui, ok := parseSimpleUserSignalFast(pl); ok {
+			d := &EnterRoom{SendTime: sendTime, UserInfo: ui}
+			*danmu = append(*danmu, d)
+		} else {
+			enter := getProto[*acproto.CommonActionSignalUserEnterRoom](enterRoomMsgPool)
+			err := proto.Unmarshal(pl, enter)
+			checkErr(err)
+			d := &EnterRoom{
+				SendTime: enter.SendTimeMs,
+				UserInfo: newUserInfo(enter.UserInfo),
+			}
+			putProto(enterRoomMsgPool, enter)
+			*danmu = append(*danmu, d)
 		}
-		putProto(enterRoomMsgPool, enter)
-		*danmu = append(*danmu, d)
 	case string(sigType) == "CommonActionSignalUserFollowAuthor":
-		follow := getProto[*acproto.CommonActionSignalUserFollowAuthor](followMsgPool)
-		err := proto.Unmarshal(pl, follow)
-		checkErr(err)
-		d := &FollowAuthor{
-			SendTime: follow.SendTimeMs,
-			UserInfo: newUserInfo(follow.UserInfo),
+		if sendTime, ui, ok := parseSimpleUserSignalFast(pl); ok {
+			d := &FollowAuthor{SendTime: sendTime, UserInfo: ui}
+			*danmu = append(*danmu, d)
+		} else {
+			follow := getProto[*acproto.CommonActionSignalUserFollowAuthor](followMsgPool)
+			err := proto.Unmarshal(pl, follow)
+			checkErr(err)
+			d := &FollowAuthor{
+				SendTime: follow.SendTimeMs,
+				UserInfo: newUserInfo(follow.UserInfo),
+			}
+			putProto(followMsgPool, follow)
+			*danmu = append(*danmu, d)
 		}
-		putProto(followMsgPool, follow)
-		*danmu = append(*danmu, d)
 	case string(sigType) == "AcfunActionSignalThrowBanana":
 		banana := getProto[*acproto.AcfunActionSignalThrowBanana](bananaMsgPool)
 		err := proto.Unmarshal(pl, banana)

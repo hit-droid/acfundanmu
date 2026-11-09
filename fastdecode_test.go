@@ -224,3 +224,117 @@ func TestParseActionSignalItemsFallback(t *testing.T) {
 		t.Fatal("空输入应返回 ok=true")
 	}
 }
+
+// standardLikeDecode / standardEnterRoomDecode / standardFollowDecode 复刻 handleActionItem
+// 中对应类型的“标准回退”解析路径，用于与快速路径对照。
+func standardLikeDecode(pl []byte) DanmuMessage {
+	like := getProto[*acproto.CommonActionSignalLike](likeMsgPool)
+	if err := proto.Unmarshal(pl, like); err != nil {
+		putProto(likeMsgPool, like)
+		return nil
+	}
+	d := &Like{SendTime: like.SendTimeMs, UserInfo: newUserInfo(like.UserInfo)}
+	putProto(likeMsgPool, like)
+	return d
+}
+
+func standardEnterRoomDecode(pl []byte) DanmuMessage {
+	enter := getProto[*acproto.CommonActionSignalUserEnterRoom](enterRoomMsgPool)
+	if err := proto.Unmarshal(pl, enter); err != nil {
+		putProto(enterRoomMsgPool, enter)
+		return nil
+	}
+	d := &EnterRoom{SendTime: enter.SendTimeMs, UserInfo: newUserInfo(enter.UserInfo)}
+	putProto(enterRoomMsgPool, enter)
+	return d
+}
+
+func standardFollowDecode(pl []byte) DanmuMessage {
+	follow := getProto[*acproto.CommonActionSignalUserFollowAuthor](followMsgPool)
+	if err := proto.Unmarshal(pl, follow); err != nil {
+		putProto(followMsgPool, follow)
+		return nil
+	}
+	d := &FollowAuthor{SendTime: follow.SendTimeMs, UserInfo: newUserInfo(follow.UserInfo)}
+	putProto(followMsgPool, follow)
+	return d
+}
+
+// simpleUserEqual 比较 (sendTime, ui) 与 DanmuMessage（Like/EnterRoom/FollowAuthor 同构）是否一致。
+func simpleUserEqual(sendTime int64, ui UserInfo, d DanmuMessage) bool {
+	if d == nil || d.GetSendTime() != sendTime {
+		return false
+	}
+	got := d.GetUserInfo()
+	return got != nil && *got == ui
+}
+
+// TestParseSimpleUserSignalMatchesStandard 验证点赞/进房/关注三类信号的热路径快速解析与标准
+// proto.Unmarshal 路径产出完全一致（含带徽章、带头像、带管理员类型、无 userInfo、附加未知字段等情形）。
+func TestParseSimpleUserSignalMatchesStandard(t *testing.T) {
+	badgeJSON := `{"medalInfo":{"uperId":111,"userId":222,"clubName":"守护团","level":5}}`
+	userInfos := []*acproto.ZtLiveUserInfo{
+		{UserId: 1001, Nickname: "昵称A"},
+		{UserId: 2002, Nickname: "昵称B", Badge: badgeJSON, UserIdentity: &acproto.ZtLiveUserIdentity{ManagerType: 1}},
+		{UserId: 3003, Nickname: "昵称C", Avatar: []*acproto.ImageCdnNode{{Url: "http://avatar/1.png"}, {Url: "http://avatar/2.png"}}, Badge: badgeJSON},
+		{UserId: 4004},
+		nil, // 无 userInfo 字段
+	}
+
+	types := []struct {
+		sig  string
+		make func(ui *acproto.ZtLiveUserInfo, ts int64) proto.Message
+		std  func(pl []byte) DanmuMessage
+	}{
+		{"CommonActionSignalLike",
+			func(ui *acproto.ZtLiveUserInfo, ts int64) proto.Message { return &acproto.CommonActionSignalLike{SendTimeMs: ts, UserInfo: ui} },
+			standardLikeDecode},
+		{"CommonActionSignalUserEnterRoom",
+			func(ui *acproto.ZtLiveUserInfo, ts int64) proto.Message { return &acproto.CommonActionSignalUserEnterRoom{SendTimeMs: ts, UserInfo: ui} },
+			standardEnterRoomDecode},
+		{"CommonActionSignalUserFollowAuthor",
+			func(ui *acproto.ZtLiveUserInfo, ts int64) proto.Message { return &acproto.CommonActionSignalUserFollowAuthor{SendTimeMs: ts, UserInfo: ui} },
+			standardFollowDecode},
+	}
+
+	for _, ty := range types {
+		for i, ui := range userInfos {
+			msg := ty.make(ui, int64(i*100+7))
+			raw, err := proto.Marshal(msg)
+			if err != nil {
+				t.Fatalf("%s case %d marshal error: %v", ty.sig, i, err)
+			}
+			// 追加一个未知字段，验证快速路径的 skip 逻辑不丢正确字段
+			rawWithUnknown := append([]byte{}, raw...)
+			rawWithUnknown = append(rawWithUnknown, 0xAA, 0x06, 0x03, 'x', 'y', 'z') // field 99, wire 2, len 3
+
+			sendTime, ui2, ok := parseSimpleUserSignalFast(rawWithUnknown)
+			if !ok {
+				t.Fatalf("%s case %d: 快速解析应成功却返回 ok=false", ty.sig, i)
+			}
+			std := ty.std(rawWithUnknown)
+			if std == nil {
+				t.Fatalf("%s case %d: 标准解析失败", ty.sig, i)
+			}
+			if !simpleUserEqual(sendTime, ui2, std) {
+				t.Fatalf("%s case %d: 快速路径与标准路径结果不一致\nsendTime=%d ui=%+v\nstd=%+v", ty.sig, i, sendTime, ui2, std)
+			}
+		}
+	}
+}
+
+// TestParseSimpleUserSignalFallback 验证对截断/非法输入快速路径返回 ok=false，从而触发标准回退。
+func TestParseSimpleUserSignalFallback(t *testing.T) {
+	msg := &acproto.CommonActionSignalLike{SendTimeMs: 1, UserInfo: &acproto.ZtLiveUserInfo{UserId: 1}}
+	raw, err := proto.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := parseSimpleUserSignalFast(raw[:len(raw)/2]); ok {
+		t.Fatal("截断输入应返回 ok=false")
+	}
+	// 空输入是合法的（无字段），快速路径应成功（ok=true）
+	if _, _, ok := parseSimpleUserSignalFast(nil); !ok {
+		t.Fatal("空输入应返回 ok=true")
+	}
+}
