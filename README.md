@@ -211,6 +211,7 @@ if err = <-ch; err != nil {
 - **评论热路径零嵌套分配轻量解析（v1.5.0）**：标准 `proto.Unmarshal` 解析每条评论时会 `reflect.New` 出 `ZtLiveUserInfo` / `ZtLiveUserIdentity` / `ImageCdnNode` 等嵌套消息（pprof 显示该部分占 `HandleActionSignal` 分配量的近四成）。v1.5.0 新增轻量解析（见 `fastdecode.go`），仅提取业务所需字段、不再构造任何嵌套 protobuf 消息；遇到非预期编码会回退到标准 `proto.Unmarshal` 以保证正确性（快速路径与标准路径在 `fastdecode_test.go` 中逐项比对一致）。`BenchmarkHandleActionSignal` 由约 27019ns 降至约 19300ns（约 **-29%**），内存约 **-27%**、分配次数约 **-12%**。
 - **外层 action signal 零分配轻量解析（v1.6.0）**：标准 `proto.Unmarshal` 反序列化整个 `ZtLiveScActionSignal` 时，会 `reflect.New` 出每条 item 的 `ZtLiveActionSignalItem` 并为其 `Payload` 拷贝出 `[][]byte`（pprof 显示该部分占 `HandleActionSignal` 分配量的过半、且是主要 CPU 来源）。v1.6.0 新增 `parseActionSignalItems` / `parseActionItem`（见 `fastdecode.go`），仅提取每条 item 的 `SignalType`（field 1）与各 `Payload`（field 2，repeated bytes）元素，不构造任何 protobuf 消息、也不对 `Payload` 做字节拷贝（直接以子切片视图传入内层解析）；遇到非预期/截断编码返回 `ok=false` 后回退到标准 `proto.Unmarshal`，正确性不被破坏（`fastdecode_test.go` 中快速路径与标准路径逐项比对一致，并覆盖字段乱序、单 item 多 payload、截断输入等情形）。`BenchmarkHandleActionSignal` 由约 19300ns 降至约 8600ns（约 **-55%**），内存约 **-57%**、分配次数约 **-58%**。
 - **点赞 / 进房 / 关注热路径零嵌套分配轻量解析（v1.7.0）**：v1.5.0 / v1.6.0 已把**评论**热路径压到下限，但实时直播流中同样高频的**点赞、进房、关注**三类信号此前仍走标准 `proto.Unmarshal`，每条都要 `reflect.New` 出 `ZtLiveUserInfo` 及其 `UserIdentity` / `Avatar` 等嵌套消息（占比与评论热路径同构）。v1.7.0 新增 `parseSimpleUserSignalFast`（见 `fastdecode.go`），仅提取 `SendTime`（field 2 varint）与 `UserInfo`（field 1 消息，复用 `parseUserInfoFast`），不构造任何嵌套 protobuf 消息；遇到非预期/截断编码返回 `ok=false` 后回退到标准 `proto.Unmarshal`（快速路径与标准路径在 `fastdecode_test.go` 中逐项比对一致，并覆盖带徽章、带头像、带管理员类型、无 userInfo、附加未知字段等情形）。`BenchmarkHandleActionSignal_Like` 由约 11876ns 降至约 5539ns（约 **-53%**），内存约 **-58%**、分配次数约 **-33%**；进房、关注同构，均约 **-52%** 耗时；混合流（评论+点赞+进房+关注）约 **-39%** 耗时、约 **-42%** 内存。评论热路径保持不变（无回归）。
+- **state / notify 信号热路径零分配轻量解析（v1.8.0）**：继 action 信号之后，实时直播流中另一类高频信号——**state 信号**（如在线人数 / 点赞总数等 `CommonStateSignalDisplayInfo` 周期性推送）与 **notify 信号**（被踢出、违规警告、房管状态变更）此前仍走标准 `proto.Unmarshal`，每条都要为外层 `ZtLiveScStateSignal` / `ZtLiveScNotifySignal` 及其每条 item 的 `SignalType` / `Payload` 做反射拷贝，并为具体消息 `reflect.New` 出完整 protobuf 消息（v1.7.0 时 `HandleStateSignal` 仍达 307 allocs/op、`HandleNotifySignal` 仍达 257 allocs/op）。v1.8.0 新增 `parseStateSignalItems` / `parseNotifySignalItems`（零分配外层解析，与 v1.6.0 的 action 外层解析同构）以及 `parseDisplayInfoFast` / `parseKickedOutFast` / `parseViolationAlertFast` / `parseLiveManagerStateFast`（仅提取各信号业务所需字段、不构造任何嵌套消息）；遇到非预期/截断编码返回 `ok=false` 后回退到标准 `proto.Unmarshal`（快速路径与标准路径在 `fastdecode_test.go` 中逐项比对一致，并含 `TestHandleStateSignalDisplayInfoFast` / `TestHandleNotifySignalKickedOutFast` 端到端验证）。`BenchmarkHandleStateSignal` 由约 15016ns 降至约 6171ns（约 **-59%**），内存约 **-57%**、分配次数约 **-35%**（307 → 200）；`BenchmarkHandleNotifySignal` 由约 13556ns 降至约 4679ns（约 **-66%**），内存约 **-64%**、分配次数约 **-42%**（257 → 150）。评论热路径保持不变（无回归）。
 - **事件分发快照去冗余（v1.5.0）**：`handleActionSignal` 的逐条分发循环原先每条弹幕都 `atomic.Load` 一次 handler 快照并重复 map 查找；改为在批次开始时只加载一次快照并复用 `dispatchEvent`，减少热路径上的原子读与查找开销。
 - **state / notify 对象池归还修复（v1.5.0）**：`handleStateSignal` / `handleNotifySignal` 原先在 per-item 循环内用 `defer putProto`，导致对象在整个信号处理结束前无法在 item 间复用、且带来循环内 defer 开销；改为每条 item 用完即还，多 item 间可复用同一池对象。
 - **健壮性与徽章解析去冗余（v1.5.0）**：修复 `newUserInfo(nil)` 的潜在空指针 panic；并将徽章解析收敛为 `parseMedal`，仅当存在徽章时才从池中借用解析器，无徽章弹幕（绝大多数）省去一次 `sync.Pool` 往返与 defer 开销。
@@ -223,7 +224,7 @@ go test -bench=. -benchmem
 
 典型基准结果（AMD EPYC，单位 ns/op）：
 
-| 基准 | v1.6.0 | v1.7.0 | 说明 |
+| 基准 | v1.6.0 | v1.8.0 | 说明 |
 | --- | --- | --- | --- |
 | BenchmarkHandleActionSignal（评论） | 8600 ns/op · 8426 B/op · 151 allocs/op | 6927 ns/op · 8425 B/op · 151 allocs/op | 评论热路径已近下限，本版持平（无回归） |
 | BenchmarkHandleActionSignal_Like（点赞） | 11876 ns/op · 12429 B/op · 151 allocs/op | 5539 ns/op · 5225 B/op · 101 allocs/op | 点赞零嵌套分配轻量解析，约 -53% 耗时 / -58% 内存 / -33% 分配 |
@@ -232,6 +233,6 @@ go test -bench=. -benchmem
 | BenchmarkHandleActionSignal_Mixed（混合） | 12173 ns/op · 10193 B/op · 151 allocs/op | 7466 ns/op · 5865 B/op · 121 allocs/op | 混合流（评论+点赞+进房+关注）约 -39% 耗时 / -42% 内存 / -20% 分配 |
 | BenchmarkCallEvent_Single | 9.6 ns/op · 0 B/op · 0 allocs/op | 8.7 ns/op · 0 B/op · 0 allocs/op | 单 handler 同步分发，免锁读取快照（持平） |
 | BenchmarkGzipDecode_New | 4293 ns/op · 0 B/op · 0 allocs/op | 4296 ns/op · 0 B/op · 0 allocs/op | 复用输出缓冲 + Reader 池，零分配（持平） |
-| BenchmarkHandleStateSignal | 16480 ns/op · 10220 B/op · 307 allocs/op | 15016 ns/op · 10220 B/op · 307 allocs/op | state 信号多 item 间复用同一池对象（持平） |
-| BenchmarkHandleNotifySignal | 13978 ns/op · 9020 B/op · 257 allocs/op | 13556 ns/op · 9020 B/op · 257 allocs/op | notify 信号同上（持平） |
+| BenchmarkHandleStateSignal | 16480 ns/op · 10220 B/op · 307 allocs/op | 6171 ns/op · 4400 B/op · 200 allocs/op | state 信号零分配外层解析 + DisplayInfo 零嵌套分配轻量解析（v1.8.0），约 -59% 耗时 / -57% 内存 / -35% 分配 |
+| BenchmarkHandleNotifySignal | 13978 ns/op · 9020 B/op · 257 allocs/op | 4679 ns/op · 3200 B/op · 150 allocs/op | notify 信号零分配外层解析 + 三类信号零嵌套分配轻量解析（v1.8.0），约 -66% 耗时 / -64% 内存 / -42% 分配 |
 | BenchmarkGzipDecode_Old（对照） | 28712 ns/op · 58640 B/op · 13 allocs/op | 19250 ns/op · 58640 B/op · 13 allocs/op | 每条消息新建 gzip.Reader（持平） |

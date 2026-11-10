@@ -567,16 +567,24 @@ func (ac *AcFunLive) handleActionSignalStandard(payload *[]byte, danmu *[]DanmuM
 
 // 处理 state signal 数据
 func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
-	stateSignal := getProto[*acproto.ZtLiveScStateSignal](stateSignalPool)
-	defer putProto(stateSignalPool, stateSignal)
-	err := proto.Unmarshal(*payload, stateSignal)
-	checkErr(err)
+	// 热路径优先用零分配的外层 state signal 轻量解析（避免标准 proto.Unmarshal 反射创建
+	// ZtLiveScStateSignal 及其每条 item 的 Payload []byte 拷贝）；遇到非预期编码时
+	// 回退到标准 proto.Unmarshal，保证行为正确。
+	if !parseStateSignalItems(*payload, func(sigType, pl []byte) {
+		item := acproto.ZtLiveStateSignalItem{SignalType: string(sigType), Payload: pl}
+		ac.handleStateItem(&item, event)
+	}) {
+		ac.handleStateSignalStandard(payload, event)
+	}
+}
 
-	for _, item := range stateSignal.Item {
-		switch item.SignalType {
+// handleStateItem 解析单个 state signal 的 payload 并派发；item 为单条 state 信号（SignalType + Payload）。
+// 快速路径（零分配轻量解析）与标准路径（pool + proto.Unmarshal）共用本函数，避免逻辑重复。
+func (ac *AcFunLive) handleStateItem(item *acproto.ZtLiveStateSignalItem, event bool) {
+	switch item.SignalType {
 		case "AcfunStateSignalDisplayInfo":
 			bananaInfo := getProto[*acproto.AcfunStateSignalDisplayInfo](stateDisplayInfoPool)
-			err = proto.Unmarshal(item.Payload, bananaInfo)
+			err := proto.Unmarshal(item.Payload, bananaInfo)
 			checkErr(err)
 			if event {
 				ac.callEvent(bananaCountEvent, bananaInfo.BananaCount)
@@ -589,8 +597,20 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			// 信号处理结束，从而恢复池化复用并消除循环内 defer 的开销。
 			putProto(stateDisplayInfoPool, bananaInfo)
 		case "CommonStateSignalDisplayInfo":
+			// 热路径优先用零嵌套分配轻量解析（避免每条 state 信号 reflect.New 出 CommonStateSignalDisplayInfo
+			// 及其 WatchingCount / LikeCount 字符串的 protobuf 拷贝）；遇到非预期编码时回退到标准 proto.Unmarshal。
+			if info, ok := parseDisplayInfoFast(item.Payload); ok {
+				if event {
+					ac.callEvent(displayEvent, &info)
+				} else {
+					ac.info.Lock()
+					ac.info.DisplayInfo = info
+					ac.info.Unlock()
+				}
+				return
+			}
 			stateInfo := getProto[*acproto.CommonStateSignalDisplayInfo](stateDisplayInfoPool)
-			err = proto.Unmarshal(item.Payload, stateInfo)
+			err := proto.Unmarshal(item.Payload, stateInfo)
 			checkErr(err)
 			info := DisplayInfo{
 				WatchingCount: stateInfo.WatchingCount,
@@ -607,7 +627,7 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			putProto(stateDisplayInfoPool, stateInfo)
 		case "CommonStateSignalTopUsers":
 			topUsers := getProto[*acproto.CommonStateSignalTopUsers](stateTopUsersPool)
-			err = proto.Unmarshal(item.Payload, topUsers)
+			err := proto.Unmarshal(item.Payload, topUsers)
 			checkErr(err)
 			users := make([]TopUser, len(topUsers.User))
 			for i, user := range topUsers.User {
@@ -629,7 +649,7 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			putProto(stateTopUsersPool, topUsers)
 		case "CommonStateSignalRecentComment":
 			comments := getProto[*acproto.CommonStateSignalRecentComment](stateRecentCommentPool)
-			err = proto.Unmarshal(item.Payload, comments)
+			err := proto.Unmarshal(item.Payload, comments)
 			checkErr(err)
 			danmu := make([]Comment, len(comments.Comment))
 			for i, comment := range comments.Comment {
@@ -652,7 +672,7 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			putProto(stateRecentCommentPool, comments)
 		case "CommonStateSignalCurrentRedpackList":
 			redpackList := getProto[*acproto.CommonStateSignalCurrentRedpackList](stateRedpackListPool)
-			err = proto.Unmarshal(item.Payload, redpackList)
+			err := proto.Unmarshal(item.Payload, redpackList)
 			checkErr(err)
 			redpacks := make([]Redpack, len(redpackList.Redpacks))
 			for i, redpack := range redpackList.Redpacks {
@@ -678,7 +698,7 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			putProto(stateRedpackListPool, redpackList)
 		case "CommonStateSignalChatCall":
 			chatCall := getProto[*acproto.CommonStateSignalChatCall](stateChatCallPool)
-			err = proto.Unmarshal(item.Payload, chatCall)
+			err := proto.Unmarshal(item.Payload, chatCall)
 			checkErr(err)
 			if event {
 				ac.callEvent(chatCallEvent, &ChatCall{
@@ -690,7 +710,7 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			putProto(stateChatCallPool, chatCall)
 		case "CommonStateSignalChatAccept":
 			chatAccept := getProto[*acproto.CommonStateSignalChatAccept](stateChatAcceptPool)
-			err = proto.Unmarshal(item.Payload, chatAccept)
+			err := proto.Unmarshal(item.Payload, chatAccept)
 			checkErr(err)
 			if event {
 				ac.callEvent(chatAcceptEvent, &ChatAccept{
@@ -702,7 +722,7 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			putProto(stateChatAcceptPool, chatAccept)
 		case "CommonStateSignalChatReady":
 			chatReady := getProto[*acproto.CommonStateSignalChatReady](stateChatReadyPool)
-			err = proto.Unmarshal(item.Payload, chatReady)
+			err := proto.Unmarshal(item.Payload, chatReady)
 			checkErr(err)
 			if event {
 				ac.callEvent(chatReadyEvent, &ChatReady{
@@ -714,7 +734,7 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			putProto(stateChatReadyPool, chatReady)
 		case "CommonStateSignalChatEnd":
 			chatEnd := getProto[*acproto.CommonStateSignalChatEnd](stateChatEndPool)
-			err = proto.Unmarshal(item.Payload, chatEnd)
+			err := proto.Unmarshal(item.Payload, chatEnd)
 			checkErr(err)
 			if event {
 				ac.callEvent(chatEndEvent, &ChatEnd{
@@ -726,7 +746,7 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 		//case "AuthorChatPlayerInfo":
 		case "CommonStateSignalAuthorChatCall":
 			chatCall := getProto[*acproto.CommonStateSignalAuthorChatCall](stateAuthorChatCallPool)
-			err = proto.Unmarshal(item.Payload, chatCall)
+			err := proto.Unmarshal(item.Payload, chatCall)
 			checkErr(err)
 			if event {
 				ac.callEvent(authorChatCallEvent, &AuthorChatCall{
@@ -742,7 +762,7 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			putProto(stateAuthorChatCallPool, chatCall)
 		case "CommonStateSignalAuthorChatAccept":
 			chatAccept := getProto[*acproto.CommonStateSignalAuthorChatAccept](stateAuthorChatAcceptPool)
-			err = proto.Unmarshal(item.Payload, chatAccept)
+			err := proto.Unmarshal(item.Payload, chatAccept)
 			checkErr(err)
 			if event {
 				ac.callEvent(authorChatAcceptEvent, &AuthorChatAccept{
@@ -753,7 +773,7 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			putProto(stateAuthorChatAcceptPool, chatAccept)
 		case "CommonStateSignalAuthorChatReady":
 			chatReady := getProto[*acproto.CommonStateSignalAuthorChatReady](stateAuthorChatReadyPool)
-			err = proto.Unmarshal(item.Payload, chatReady)
+			err := proto.Unmarshal(item.Payload, chatReady)
 			checkErr(err)
 			if event {
 				ac.callEvent(authorChatReadyEvent, &AuthorChatReady{
@@ -773,7 +793,7 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			putProto(stateAuthorChatReadyPool, chatReady)
 		case "CommonStateSignalAuthorChatEnd":
 			chatEnd := getProto[*acproto.CommonStateSignalAuthorChatEnd](stateAuthorChatEndPool)
-			err = proto.Unmarshal(item.Payload, chatEnd)
+			err := proto.Unmarshal(item.Payload, chatEnd)
 			checkErr(err)
 			if event {
 				ac.callEvent(authorChatEndEvent, &AuthorChatEnd{
@@ -785,7 +805,7 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			putProto(stateAuthorChatEndPool, chatEnd)
 		case "CommonStateSignalAuthorChatChangeSoundConfig":
 			soundConfig := getProto[*acproto.CommonStateSignalAuthorChatChangeSoundConfig](stateAuthorChatSoundPool)
-			err = proto.Unmarshal(item.Payload, soundConfig)
+			err := proto.Unmarshal(item.Payload, soundConfig)
 			checkErr(err)
 			if event {
 				ac.callEvent(authorChatChangeSoundConfigEvent, &AuthorChatChangeSoundConfig{
@@ -796,7 +816,7 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			putProto(stateAuthorChatSoundPool, soundConfig)
 		case "CommonStateSignalLiveState":
 			liveState := getProto[*acproto.CommonStateSignalLiveState](stateLiveStatePool)
-			err = proto.Unmarshal(item.Payload, liveState)
+			err := proto.Unmarshal(item.Payload, liveState)
 			checkErr(err)
 			if event {
 				ac.callEvent(liveStateEvent, &LiveState{
@@ -808,11 +828,22 @@ func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 			putProto(stateLiveStatePool, liveState)
 		case "CommonStateSignalArLiveTreasureBoxState":
 		default:
-			log.Printf("未知的State Signal item.SignalType：%s\npayload string:\n%s\npayload base64:\n%s\n",
-				item.SignalType,
-				string(item.Payload),
-				base64.StdEncoding.EncodeToString(item.Payload))
+		log.Printf("未知的State Signal item.SignalType：%s\npayload string:\n%s\npayload base64:\n%s\n",
+			item.SignalType,
+			string(item.Payload),
+			base64.StdEncoding.EncodeToString(item.Payload))
 		}
+	}
+
+// handleStateSignalStandard 标准解析路径：用池化消息 + proto.Unmarshal 完整解析 state signal，
+// 仅在快速路径遇到非预期编码时作为回退调用，保证行为与历史版本完全一致。
+func (ac *AcFunLive) handleStateSignalStandard(payload *[]byte, event bool) {
+	stateSignal := getProto[*acproto.ZtLiveScStateSignal](stateSignalPool)
+	defer putProto(stateSignalPool, stateSignal)
+	err := proto.Unmarshal(*payload, stateSignal)
+	checkErr(err)
+	for _, item := range stateSignal.Item {
+		ac.handleStateItem(item, event)
 	}
 }
 
@@ -830,54 +861,107 @@ func danmuLess(a, b DanmuMessage) int {
 
 // 处理 notify signal 数据
 func (ac *AcFunLive) handleNotifySignal(payload *[]byte, event bool) {
+	// 热路径优先用零分配的外层 notify signal 轻量解析（避免标准 proto.Unmarshal 反射创建
+	// ZtLiveScNotifySignal 及其每条 item 的 Payload []byte 拷贝）；遇到非预期编码时
+	// 回退到标准 proto.Unmarshal，保证行为正确。
+	if !parseNotifySignalItems(*payload, func(sigType, pl []byte) {
+		item := acproto.ZtLiveNotifySignalItem{SignalType: string(sigType), Payload: pl}
+		ac.handleNotifyItem(&item, event)
+	}) {
+		ac.handleNotifySignalStandard(payload, event)
+	}
+}
+
+// handleNotifyItem 解析单个 notify signal 的 payload 并派发；item 为单条 notify 信号（SignalType + Payload）。
+// 快速路径（零分配轻量解析）与标准路径（pool + proto.Unmarshal）共用本函数，避免逻辑重复。
+func (ac *AcFunLive) handleNotifyItem(item *acproto.ZtLiveNotifySignalItem, event bool) {
+	switch item.SignalType {
+	case "CommonNotifySignalKickedOut":
+		// 热路径优先用零嵌套分配轻量解析（仅提取 reason 字符串）；遇到非预期编码时回退到标准 proto.Unmarshal。
+		if reason, ok := parseKickedOutFast(item.Payload); ok {
+			if event {
+				ac.callEvent(kickedOutEvent, reason)
+			} else {
+				ac.info.Lock()
+				ac.info.KickedOut = reason
+				ac.info.Unlock()
+			}
+			return
+		}
+		kickedOut := getProto[*acproto.CommonNotifySignalKickedOut](notifyKickedOutPool)
+		err := proto.Unmarshal(item.Payload, kickedOut)
+		checkErr(err)
+		if event {
+			ac.callEvent(kickedOutEvent, kickedOut.Reason)
+		} else {
+			ac.info.Lock()
+			ac.info.KickedOut = kickedOut.Reason
+			ac.info.Unlock()
+		}
+		// 用完即还：循环内每条 item 复用同一对象池，恢复池化复用并消除循环内 defer 开销。
+		putProto(notifyKickedOutPool, kickedOut)
+	case "CommonNotifySignalViolationAlert":
+		// 热路径优先用零嵌套分配轻量解析（仅提取 violationContent 字符串）；遇到非预期编码时回退到标准 proto.Unmarshal。
+		if content, ok := parseViolationAlertFast(item.Payload); ok {
+			if event {
+				ac.callEvent(violationAlertEvent, content)
+			} else {
+				ac.info.Lock()
+				ac.info.ViolationAlert = content
+				ac.info.Unlock()
+			}
+			return
+		}
+		violationAlert := getProto[*acproto.CommonNotifySignalViolationAlert](notifyViolationPool)
+		err := proto.Unmarshal(item.Payload, violationAlert)
+		checkErr(err)
+		if event {
+			ac.callEvent(violationAlertEvent, violationAlert.ViolationContent)
+		} else {
+			ac.info.Lock()
+			ac.info.ViolationAlert = violationAlert.ViolationContent
+			ac.info.Unlock()
+		}
+		putProto(notifyViolationPool, violationAlert)
+	case "CommonNotifySignalLiveManagerState":
+		// 热路径优先用零嵌套分配轻量解析（仅提取 state 枚举值）；遇到非预期编码时回退到标准 proto.Unmarshal。
+		if state, ok := parseLiveManagerStateFast(item.Payload); ok {
+			if event {
+				ac.callEvent(managerStateEvent, state)
+			} else {
+				ac.info.Lock()
+				ac.info.LiveManagerState = state
+				ac.info.Unlock()
+			}
+			return
+		}
+		liveManagerState := getProto[*acproto.CommonNotifySignalLiveManagerState](notifyManagerStatePool)
+		err := proto.Unmarshal(item.Payload, liveManagerState)
+		checkErr(err)
+		if event {
+			ac.callEvent(managerStateEvent, ManagerState(liveManagerState.State))
+		} else {
+			ac.info.Lock()
+			ac.info.LiveManagerState = ManagerState(liveManagerState.State)
+			ac.info.Unlock()
+		}
+		putProto(notifyManagerStatePool, liveManagerState)
+	default:
+		log.Printf("未知的Notify Signal signalType：%s\npayload string:\n%s\npayload base64:\n%s\n",
+			item.SignalType,
+			string(item.Payload),
+			base64.StdEncoding.EncodeToString(item.Payload))
+	}
+}
+
+// handleNotifySignalStandard 标准解析路径：用池化消息 + proto.Unmarshal 完整解析 notify signal，
+// 仅在快速路径遇到非预期编码时作为回退调用，保证行为与历史版本完全一致。
+func (ac *AcFunLive) handleNotifySignalStandard(payload *[]byte, event bool) {
 	notifySignal := getProto[*acproto.ZtLiveScNotifySignal](notifySignalPool)
 	defer putProto(notifySignalPool, notifySignal)
 	err := proto.Unmarshal(*payload, notifySignal)
 	checkErr(err)
 	for _, item := range notifySignal.Item {
-		switch item.SignalType {
-		case "CommonNotifySignalKickedOut":
-			kickedOut := getProto[*acproto.CommonNotifySignalKickedOut](notifyKickedOutPool)
-			err = proto.Unmarshal(item.Payload, kickedOut)
-			checkErr(err)
-			if event {
-				ac.callEvent(kickedOutEvent, kickedOut.Reason)
-			} else {
-				ac.info.Lock()
-				ac.info.KickedOut = kickedOut.Reason
-				ac.info.Unlock()
-			}
-			// 用完即还：循环内每条 item 复用同一对象池，恢复池化复用并消除循环内 defer 开销。
-			putProto(notifyKickedOutPool, kickedOut)
-		case "CommonNotifySignalViolationAlert":
-			violationAlert := getProto[*acproto.CommonNotifySignalViolationAlert](notifyViolationPool)
-			err = proto.Unmarshal(item.Payload, violationAlert)
-			checkErr(err)
-			if event {
-				ac.callEvent(violationAlertEvent, violationAlert.ViolationContent)
-			} else {
-				ac.info.Lock()
-				ac.info.ViolationAlert = violationAlert.ViolationContent
-				ac.info.Unlock()
-			}
-			putProto(notifyViolationPool, violationAlert)
-		case "CommonNotifySignalLiveManagerState":
-			liveManagerState := getProto[*acproto.CommonNotifySignalLiveManagerState](notifyManagerStatePool)
-			err = proto.Unmarshal(item.Payload, liveManagerState)
-			checkErr(err)
-			if event {
-				ac.callEvent(managerStateEvent, ManagerState(liveManagerState.State))
-			} else {
-				ac.info.Lock()
-				ac.info.LiveManagerState = ManagerState(liveManagerState.State)
-				ac.info.Unlock()
-			}
-			putProto(notifyManagerStatePool, liveManagerState)
-		default:
-			log.Printf("未知的Notify Signal signalType：%s\npayload string:\n%s\npayload base64:\n%s\n",
-				item.SignalType,
-				string(item.Payload),
-				base64.StdEncoding.EncodeToString(item.Payload))
-		}
+		ac.handleNotifyItem(item, event)
 	}
 }

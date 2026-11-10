@@ -393,3 +393,236 @@ func parseActionItem(b []byte, fn func(sigType, pl []byte)) bool {
 	}
 	return true
 }
+
+// parseSinglePayloadItem 解析单个 item（ZtLiveStateSignalItem / ZtLiveNotifySignalItem 同构）：
+// 提取 SignalType（field 1，string）与 Payload（field 2，单条 bytes），调用 fn(sigType, payload)。
+// 以子切片视图（不拷贝）传入，由内层解析再显式拷贝出所需字段，既避免堆分配又保证别名安全。
+func parseSinglePayloadItem(b []byte, fn func(sigType, payload []byte)) bool {
+	var sigType []byte
+	var payload []byte
+	for len(b) > 0 {
+		tag, n := readVarint(b)
+		if n <= 0 {
+			return false
+		}
+		b = b[n:]
+		field := tag >> 3
+		wire := tag & 7
+		switch {
+		case field == 1 && wire == 2: // signalType
+			v, n2 := readVarint(b)
+			if n2 <= 0 || uint64(len(b)-n2) < v {
+				return false
+			}
+			sigType = b[n2 : n2+int(v)]
+			b = b[n2+int(v):]
+		case field == 2 && wire == 2: // payload（单条 bytes）
+			v, n2 := readVarint(b)
+			if n2 <= 0 || uint64(len(b)-n2) < v {
+				return false
+			}
+			payload = b[n2 : n2+int(v)]
+			b = b[n2+int(v):]
+		default:
+			rest, ok := skipField(b, wire)
+			if !ok {
+				return false
+			}
+			b = rest
+		}
+	}
+	fn(sigType, payload)
+	return true
+}
+
+// parseStateSignalItems 零分配遍历 ZtLiveScStateSignal 的 item，对每个 item 调用 fn(sigType, payload)。
+// 仅提取 SignalType（field 1）与 Payload（field 2，单条 bytes），不构造任何 protobuf 消息，
+// 从而消除标准 proto.Unmarshal 为每条 item 反射创建 ZtLiveStateSignalItem 及其 SignalType / Payload
+// 拷贝带来的分配与 CPU 开销（pprof 显示该部分占 HandleStateSignal 分配量的相当比例）。
+// 遇到任何非预期/截断的编码一律返回 false，由调用方回退到标准 proto.Unmarshal，保证行为正确。
+func parseStateSignalItems(b []byte, fn func(sigType, payload []byte)) bool {
+	for len(b) > 0 {
+		tag, n := readVarint(b)
+		if n <= 0 {
+			return false
+		}
+		b = b[n:]
+		field := tag >> 3
+		wire := tag & 7
+		if field == 1 && wire == 2 { // item（repeated ZtLiveStateSignalItem，field 1）
+			v, n2 := readVarint(b)
+			if n2 <= 0 || uint64(len(b)-n2) < v {
+				return false
+			}
+			item := b[n2 : n2+int(v)]
+			b = b[n2+int(v):]
+			if !parseSinglePayloadItem(item, fn) {
+				return false
+			}
+		} else {
+			rest, ok := skipField(b, wire)
+			if !ok {
+				return false
+			}
+			b = rest
+		}
+	}
+	return true
+}
+
+// parseNotifySignalItems 零分配遍历 ZtLiveScNotifySignal 的 item，语义与 parseStateSignalItems 同构
+// （ZtLiveNotifySignalItem 与 ZtLiveStateSignalItem 字段结构一致：SignalType field 1 + Payload field 2 单条 bytes）。
+func parseNotifySignalItems(b []byte, fn func(sigType, payload []byte)) bool {
+	for len(b) > 0 {
+		tag, n := readVarint(b)
+		if n <= 0 {
+			return false
+		}
+		b = b[n:]
+		field := tag >> 3
+		wire := tag & 7
+		if field == 1 && wire == 2 { // item（repeated ZtLiveNotifySignalItem，field 1）
+			v, n2 := readVarint(b)
+			if n2 <= 0 || uint64(len(b)-n2) < v {
+				return false
+			}
+			item := b[n2 : n2+int(v)]
+			b = b[n2+int(v):]
+			if !parseSinglePayloadItem(item, fn) {
+				return false
+			}
+		} else {
+			rest, ok := skipField(b, wire)
+			if !ok {
+				return false
+			}
+			b = rest
+		}
+	}
+	return true
+}
+
+// parseDisplayInfoFast 零嵌套分配解析 CommonStateSignalDisplayInfo 热路径字段
+// （WatchingCount field 1 string、LikeCount field 2 string、LikeDelta field 3 varint），
+// 不构造任何 protobuf 消息；任何非预期/截断编码返回 (DisplayInfo{}, false)，由调用方回退标准解析。
+func parseDisplayInfoFast(pl []byte) (DisplayInfo, bool) {
+	var info DisplayInfo
+	for len(pl) > 0 {
+		tag, n := readVarint(pl)
+		if n <= 0 {
+			return DisplayInfo{}, false
+		}
+		pl = pl[n:]
+		field := tag >> 3
+		wire := tag & 7
+		switch {
+		case field == 1 && wire == 2: // watchingCount
+			v, n2 := readVarint(pl)
+			if n2 <= 0 || uint64(len(pl)-n2) < v {
+				return DisplayInfo{}, false
+			}
+			info.WatchingCount = string(pl[n2 : n2+int(v)])
+			pl = pl[n2+int(v):]
+		case field == 2 && wire == 2: // likeCount
+			v, n2 := readVarint(pl)
+			if n2 <= 0 || uint64(len(pl)-n2) < v {
+				return DisplayInfo{}, false
+			}
+			info.LikeCount = string(pl[n2 : n2+int(v)])
+			pl = pl[n2+int(v):]
+		case field == 3 && wire == 0: // likeDelta
+			v, n2 := readVarint(pl)
+			if n2 <= 0 {
+				return DisplayInfo{}, false
+			}
+			info.LikeDelta = int(v)
+			pl = pl[n2:]
+		default:
+			rest, ok := skipField(pl, wire)
+			if !ok {
+				return DisplayInfo{}, false
+			}
+			pl = rest
+		}
+	}
+	return info, true
+}
+
+// parseKickedOutFast 提取 CommonNotifySignalKickedOut 的 reason 字段（field 1 string），
+// 不构造任何 protobuf 消息；遇到非预期/截断编码返回 ("", false)。
+func parseKickedOutFast(pl []byte) (string, bool) {
+	for len(pl) > 0 {
+		tag, n := readVarint(pl)
+		if n <= 0 {
+			return "", false
+		}
+		pl = pl[n:]
+		field := tag >> 3
+		wire := tag & 7
+		if field == 1 && wire == 2 { // reason
+			v, n2 := readVarint(pl)
+			if n2 <= 0 || uint64(len(pl)-n2) < v {
+				return "", false
+			}
+			return string(pl[n2 : n2+int(v)]), true
+		}
+		rest, ok := skipField(pl, wire)
+		if !ok {
+			return "", false
+		}
+		pl = rest
+	}
+	return "", true
+}
+
+// parseViolationAlertFast 提取 CommonNotifySignalViolationAlert 的 violationContent 字段（field 1 string）。
+func parseViolationAlertFast(pl []byte) (string, bool) {
+	for len(pl) > 0 {
+		tag, n := readVarint(pl)
+		if n <= 0 {
+			return "", false
+		}
+		pl = pl[n:]
+		field := tag >> 3
+		wire := tag & 7
+		if field == 1 && wire == 2 { // violationContent
+			v, n2 := readVarint(pl)
+			if n2 <= 0 || uint64(len(pl)-n2) < v {
+				return "", false
+			}
+			return string(pl[n2 : n2+int(v)]), true
+		}
+		rest, ok := skipField(pl, wire)
+		if !ok {
+			return "", false
+		}
+		pl = rest
+	}
+	return "", true
+}
+
+// parseLiveManagerStateFast 提取 CommonNotifySignalLiveManagerState 的 state 字段（field 1 varint）。
+func parseLiveManagerStateFast(pl []byte) (ManagerState, bool) {
+	for len(pl) > 0 {
+		tag, n := readVarint(pl)
+		if n <= 0 {
+			return 0, false
+		}
+		pl = pl[n:]
+		field := tag >> 3
+		wire := tag & 7
+		if field == 1 && wire == 0 { // state
+			v, n2 := readVarint(pl)
+			if n2 <= 0 {
+				return 0, false
+			}
+			return ManagerState(v), true
+		}
+		rest, ok := skipField(pl, wire)
+		if !ok {
+			return 0, false
+		}
+		pl = rest
+	}
+	return 0, true
+}

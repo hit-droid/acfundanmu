@@ -3,6 +3,7 @@ package acfundanmu
 import (
 	"bytes"
 	"testing"
+	"time"
 
 	"github.com/orzogc/acfundanmu/acproto"
 	"google.golang.org/protobuf/proto"
@@ -336,5 +337,336 @@ func TestParseSimpleUserSignalFallback(t *testing.T) {
 	// 空输入是合法的（无字段），快速路径应成功（ok=true）
 	if _, _, ok := parseSimpleUserSignalFast(nil); !ok {
 		t.Fatal("空输入应返回 ok=true")
+	}
+}
+
+// === v1.8.0 新增：state / notify 信号快速解析测试 ===
+
+// standardDisplayInfoDecode 复刻 handleStateItem 中 CommonStateSignalDisplayInfo 的“标准回退”解析路径。
+func standardDisplayInfoDecode(pl []byte) (DisplayInfo, bool) {
+	di := getProto[*acproto.CommonStateSignalDisplayInfo](stateDisplayInfoPool)
+	if err := proto.Unmarshal(pl, di); err != nil {
+		putProto(stateDisplayInfoPool, di)
+		return DisplayInfo{}, false
+	}
+	info := DisplayInfo{
+		WatchingCount: di.WatchingCount,
+		LikeCount:     di.LikeCount,
+		LikeDelta:     int(di.LikeDelta),
+	}
+	putProto(stateDisplayInfoPool, di)
+	return info, true
+}
+
+func displayInfoEqual(a, b DisplayInfo) bool {
+	return a.WatchingCount == b.WatchingCount && a.LikeCount == b.LikeCount && a.LikeDelta == b.LikeDelta
+}
+
+func standardKickedOutDecode(pl []byte) (string, bool) {
+	k := getProto[*acproto.CommonNotifySignalKickedOut](notifyKickedOutPool)
+	if err := proto.Unmarshal(pl, k); err != nil {
+		putProto(notifyKickedOutPool, k)
+		return "", false
+	}
+	r := k.Reason
+	putProto(notifyKickedOutPool, k)
+	return r, true
+}
+
+func standardViolationAlertDecode(pl []byte) (string, bool) {
+	v := getProto[*acproto.CommonNotifySignalViolationAlert](notifyViolationPool)
+	if err := proto.Unmarshal(pl, v); err != nil {
+		putProto(notifyViolationPool, v)
+		return "", false
+	}
+	c := v.ViolationContent
+	putProto(notifyViolationPool, v)
+	return c, true
+}
+
+func standardLiveManagerStateDecode(pl []byte) (ManagerState, bool) {
+	s := getProto[*acproto.CommonNotifySignalLiveManagerState](notifyManagerStatePool)
+	if err := proto.Unmarshal(pl, s); err != nil {
+		putProto(notifyManagerStatePool, s)
+		return 0, false
+	}
+	st := ManagerState(s.State)
+	putProto(notifyManagerStatePool, s)
+	return st, true
+}
+
+func TestParseDisplayInfoFastMatchesStandard(t *testing.T) {
+	cases := []*acproto.CommonStateSignalDisplayInfo{
+		{WatchingCount: "12345", LikeCount: "678", LikeDelta: 9},
+		{WatchingCount: "0", LikeCount: "0", LikeDelta: 0},
+		{WatchingCount: "999999", LikeCount: "111", LikeDelta: -5},
+		{WatchingCount: "中文观众", LikeCount: "点赞数", LikeDelta: 100},
+	}
+	for i, c := range cases {
+		raw, err := proto.Marshal(c)
+		if err != nil {
+			t.Fatalf("case %d marshal: %v", i, err)
+		}
+		rawWithUnknown := append([]byte{}, raw...)
+		rawWithUnknown = append(rawWithUnknown, 0xAA, 0x06, 0x03, 'x', 'y', 'z') // field 99, wire 2, len 3
+		fast, ok := parseDisplayInfoFast(rawWithUnknown)
+		if !ok {
+			t.Fatalf("case %d: parseDisplayInfoFast 应成功却返回 ok=false", i)
+		}
+		std, ok2 := standardDisplayInfoDecode(rawWithUnknown)
+		if !ok2 {
+			t.Fatalf("case %d: 标准解析失败", i)
+		}
+		if !displayInfoEqual(fast, std) {
+			t.Fatalf("case %d: 快速路径与标准路径结果不一致\nfast=%+v\nstd =%+v", i, fast, std)
+		}
+	}
+}
+
+func TestParseDisplayInfoFastFallback(t *testing.T) {
+	c := &acproto.CommonStateSignalDisplayInfo{WatchingCount: "1", LikeCount: "2", LikeDelta: 3}
+	raw, _ := proto.Marshal(c)
+	if _, ok := parseDisplayInfoFast(raw[:len(raw)/2]); ok {
+		t.Fatal("截断输入应返回 ok=false")
+	}
+	if _, ok := parseDisplayInfoFast(nil); !ok {
+		t.Fatal("空输入应返回 ok=true")
+	}
+}
+
+func TestParseKickedOutFastMatchesStandard(t *testing.T) {
+	cases := []string{"你已被移出直播间", "", "reason with 中文"}
+	for i, r := range cases {
+		k := &acproto.CommonNotifySignalKickedOut{Reason: r}
+		raw, err := proto.Marshal(k)
+		if err != nil {
+			t.Fatalf("case %d marshal: %v", i, err)
+		}
+		rawWithUnknown := append([]byte{}, raw...)
+		rawWithUnknown = append(rawWithUnknown, 0xAA, 0x06, 0x03, 'x', 'y', 'z')
+		fast, ok := parseKickedOutFast(rawWithUnknown)
+		if !ok {
+			t.Fatalf("case %d: parseKickedOutFast 应成功却返回 ok=false", i)
+		}
+		std, ok2 := standardKickedOutDecode(rawWithUnknown)
+		if !ok2 {
+			t.Fatalf("case %d: 标准解析失败", i)
+		}
+		if fast != std {
+			t.Fatalf("case %d: 快速路径与标准路径结果不一致 fast=%q std=%q", i, fast, std)
+		}
+	}
+}
+
+func TestParseViolationAlertFastMatchesStandard(t *testing.T) {
+	cases := []string{"警告内容", "", "violation 中文"}
+	for i, c := range cases {
+		v := &acproto.CommonNotifySignalViolationAlert{ViolationContent: c}
+		raw, err := proto.Marshal(v)
+		if err != nil {
+			t.Fatalf("case %d marshal: %v", i, err)
+		}
+		rawWithUnknown := append([]byte{}, raw...)
+		rawWithUnknown = append(rawWithUnknown, 0xAA, 0x06, 0x03, 'x', 'y', 'z')
+		fast, ok := parseViolationAlertFast(rawWithUnknown)
+		if !ok {
+			t.Fatalf("case %d: parseViolationAlertFast 应成功却返回 ok=false", i)
+		}
+		std, ok2 := standardViolationAlertDecode(rawWithUnknown)
+		if !ok2 {
+			t.Fatalf("case %d: 标准解析失败", i)
+		}
+		if fast != std {
+			t.Fatalf("case %d: 快速路径与标准路径结果不一致 fast=%q std=%q", i, fast, std)
+		}
+	}
+}
+
+func TestParseLiveManagerStateFastMatchesStandard(t *testing.T) {
+	cases := []int32{0, 1, 2, 100}
+	for i, s := range cases {
+		m := &acproto.CommonNotifySignalLiveManagerState{State: acproto.CommonNotifySignalLiveManagerState_ManagerState(s)}
+		raw, err := proto.Marshal(m)
+		if err != nil {
+			t.Fatalf("case %d marshal: %v", i, err)
+		}
+		rawWithUnknown := append([]byte{}, raw...)
+		rawWithUnknown = append(rawWithUnknown, 0xAA, 0x06, 0x03, 'x', 'y', 'z')
+		fast, ok := parseLiveManagerStateFast(rawWithUnknown)
+		if !ok {
+			t.Fatalf("case %d: parseLiveManagerStateFast 应成功却返回 ok=false", i)
+		}
+		std, ok2 := standardLiveManagerStateDecode(rawWithUnknown)
+		if !ok2 {
+			t.Fatalf("case %d: 标准解析失败", i)
+		}
+		if fast != std {
+			t.Fatalf("case %d: 快速路径与标准路径结果不一致 fast=%v std=%v", i, fast, std)
+		}
+	}
+}
+
+// buildStateSignalRaw 把若干 item 字节按外层 ZtLiveScStateSignal / ZtLiveScNotifySignal 的重复 field 1 拼装成完整消息。
+func buildStateSignalRaw(items [][]byte) []byte {
+	var buf bytes.Buffer
+	for _, it := range items {
+		buf.WriteByte(0x0a) // field 1, wire 2
+		writeVarint(&buf, len(it))
+		buf.Write(it)
+	}
+	return buf.Bytes()
+}
+
+func buildNotifySignalRaw(items [][]byte) []byte {
+	return buildStateSignalRaw(items)
+}
+
+// stateNotifyItem 构造单个 ZtLiveStateSignalItem / ZtLiveNotifySignalItem 的字节（SignalType field 1 + Payload field 2 单条 bytes）。
+func stateNotifyItem(sig string, payload []byte) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(0x0a) // field 1, wire 2
+	writeVarint(&buf, len(sig))
+	buf.WriteString(sig)
+	buf.WriteByte(0x12) // field 2, wire 2
+	writeVarint(&buf, len(payload))
+	buf.Write(payload)
+	return buf.Bytes()
+}
+
+func TestParseStateSignalItems(t *testing.T) {
+	di, _ := proto.Marshal(&acproto.CommonStateSignalDisplayInfo{WatchingCount: "1", LikeCount: "2", LikeDelta: 3})
+	ko, _ := proto.Marshal(&acproto.CommonNotifySignalKickedOut{Reason: "r"})
+	items := [][]byte{
+		stateNotifyItem("CommonStateSignalDisplayInfo", di),
+		stateNotifyItem("CommonNotifySignalKickedOut", ko),
+	}
+	raw := buildStateSignalRaw(items)
+	type pair struct {
+		sig string
+		pl  []byte
+	}
+	var fast []pair
+	ok := parseStateSignalItems(raw, func(sigType, payload []byte) {
+		p := make([]byte, len(payload))
+		copy(p, payload)
+		fast = append(fast, pair{string(sigType), p})
+	})
+	if !ok {
+		t.Fatal("parseStateSignalItems 应成功却返回 ok=false")
+	}
+	stdMsg := new(acproto.ZtLiveScStateSignal)
+	if err := proto.Unmarshal(raw, stdMsg); err != nil {
+		t.Fatalf("标准解析失败: %v", err)
+	}
+	var std []pair
+	for _, item := range stdMsg.Item {
+		p := make([]byte, len(item.Payload))
+		copy(p, item.Payload)
+		std = append(std, pair{item.SignalType, p})
+	}
+	if len(fast) != len(std) {
+		t.Fatalf("快速路径与标准路径数量不一致: fast=%d std=%d", len(fast), len(std))
+	}
+	for i := range fast {
+		if fast[i].sig != std[i].sig || !bytes.Equal(fast[i].pl, std[i].pl) {
+			t.Fatalf("第 %d 项不一致: fast=%q,%x  std=%q,%x", i, fast[i].sig, fast[i].pl, std[i].sig, std[i].pl)
+		}
+	}
+}
+
+func TestParseNotifySignalItems(t *testing.T) {
+	ko, _ := proto.Marshal(&acproto.CommonNotifySignalKickedOut{Reason: "r"})
+	va, _ := proto.Marshal(&acproto.CommonNotifySignalViolationAlert{ViolationContent: "v"})
+	items := [][]byte{
+		stateNotifyItem("CommonNotifySignalKickedOut", ko),
+		stateNotifyItem("CommonNotifySignalViolationAlert", va),
+	}
+	raw := buildNotifySignalRaw(items)
+	type pair struct {
+		sig string
+		pl  []byte
+	}
+	var fast []pair
+	ok := parseNotifySignalItems(raw, func(sigType, payload []byte) {
+		p := make([]byte, len(payload))
+		copy(p, payload)
+		fast = append(fast, pair{string(sigType), p})
+	})
+	if !ok {
+		t.Fatal("parseNotifySignalItems 应成功却返回 ok=false")
+	}
+	stdMsg := new(acproto.ZtLiveScNotifySignal)
+	if err := proto.Unmarshal(raw, stdMsg); err != nil {
+		t.Fatalf("标准解析失败: %v", err)
+	}
+	var std []pair
+	for _, item := range stdMsg.Item {
+		p := make([]byte, len(item.Payload))
+		copy(p, item.Payload)
+		std = append(std, pair{item.SignalType, p})
+	}
+	if len(fast) != len(std) {
+		t.Fatalf("快速路径与标准路径数量不一致: fast=%d std=%d", len(fast), len(std))
+	}
+	for i := range fast {
+		if fast[i].sig != std[i].sig || !bytes.Equal(fast[i].pl, std[i].pl) {
+			t.Fatalf("第 %d 项不一致: fast=%q,%x  std=%q,%x", i, fast[i].sig, fast[i].pl, std[i].sig, std[i].pl)
+		}
+	}
+}
+
+func TestParseStateSignalItemsFallback(t *testing.T) {
+	di, _ := proto.Marshal(&acproto.CommonStateSignalDisplayInfo{WatchingCount: "1", LikeCount: "2", LikeDelta: 3})
+	item := stateNotifyItem("CommonStateSignalDisplayInfo", di)
+	raw := buildStateSignalRaw([][]byte{item})
+	if ok := parseStateSignalItems(raw[:len(raw)/2], func(_, _ []byte) {}); ok {
+		t.Fatal("截断输入应返回 ok=false")
+	}
+	if ok := parseStateSignalItems(nil, func(_, _ []byte) {}); !ok {
+		t.Fatal("空输入应返回 ok=true")
+	}
+}
+
+func TestHandleStateSignalDisplayInfoFast(t *testing.T) {
+	ac := &AcFunLive{}
+	ac.handlerMap = new(handlerMap)
+	got := make(chan DisplayInfo, 1)
+	ac.OnDisplayInfo(func(_ *AcFunLive, info *DisplayInfo) {
+		got <- *info
+	})
+	di := &acproto.CommonStateSignalDisplayInfo{WatchingCount: "12345", LikeCount: "678", LikeDelta: 9}
+	pl, _ := proto.Marshal(di)
+	item := stateNotifyItem("CommonStateSignalDisplayInfo", pl)
+	raw := buildStateSignalRaw([][]byte{item})
+	ac.handleStateSignal(&raw, true)
+	select {
+	case info := <-got:
+		if info.WatchingCount != "12345" || info.LikeCount != "678" || info.LikeDelta != 9 {
+			t.Fatalf("state display info 不一致: %+v", info)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnDisplayInfo 未被调用")
+	}
+}
+
+func TestHandleNotifySignalKickedOutFast(t *testing.T) {
+	ac := &AcFunLive{}
+	ac.handlerMap = new(handlerMap)
+	got := make(chan string, 1)
+	ac.OnKickedOut(func(_ *AcFunLive, reason string) {
+		got <- reason
+	})
+	k := &acproto.CommonNotifySignalKickedOut{Reason: "你已被移出直播间"}
+	pl, _ := proto.Marshal(k)
+	item := stateNotifyItem("CommonNotifySignalKickedOut", pl)
+	raw := buildNotifySignalRaw([][]byte{item})
+	ac.handleNotifySignal(&raw, true)
+	select {
+	case reason := <-got:
+		if reason != "你已被移出直播间" {
+			t.Fatalf("kicked out reason 不一致: %q", reason)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnKickedOut 未被调用")
 	}
 }

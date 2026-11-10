@@ -1,44 +1,11 @@
-goos: linux
-goarch: amd64
-pkg: github.com/orzogc/acfundanmu
-cpu: AMD EPYC 9K65 192-Core Processor
-BenchmarkHandleActionSignal-5             	  300000	      6927 ns/op	    8425 B/op	     151 allocs/op
-BenchmarkHandleActionSignal_Like-5        	  300000	      5539 ns/op	    5225 B/op	     101 allocs/op
-BenchmarkHandleActionSignal_EnterRoom-5   	  300000	      5513 ns/op	    5225 B/op	     101 allocs/op
-BenchmarkHandleActionSignal_Follow-5     	  300000	      5556 ns/op	    5225 B/op	     101 allocs/op
-BenchmarkHandleActionSignal_Mixed-5      	  300000	      7466 ns/op	    5865 B/op	     121 allocs/op
-BenchmarkGzipDecode_Old-5                 	  200000	     19250 ns/op	   58640 B/op	      13 allocs/op
-BenchmarkGzipDecode_New-5                 	  277369	      4296 ns/op	       0 B/op	       0 allocs/op
-BenchmarkCallEvent_Single-5              	127898391	         8.694 ns/op	       0 B/op	       0 allocs/op
-BenchmarkHandleStateSignal-5             	   70722	     15016 ns/op	   10220 B/op	     307 allocs/op
-BenchmarkHandleNotifySignal-5            	   85537	     13556 ns/op	    9020 B/op	     257 allocs/op
+BenchmarkHandleActionSignal-5             	  139719	      8768 ns/op	    8426 B/op	     151 allocs/op
+BenchmarkHandleActionSignal_Like-5        	  159266	      6671 ns/op	    5225 B/op	     101 allocs/op
+BenchmarkHandleActionSignal_EnterRoom-5   	  176365	      6726 ns/op	    5225 B/op	     101 allocs/op
+BenchmarkHandleActionSignal_Follow-5      	  169794	      6985 ns/op	    5225 B/op	     101 allocs/op
+BenchmarkHandleActionSignal_Mixed-5       	  136436	      8568 ns/op	    5865 B/op	     121 allocs/op
+BenchmarkGzipDecode_Old-5                 	   42985	     28273 ns/op	   58640 B/op	      13 allocs/op
+BenchmarkGzipDecode_New-5                 	  263239	      4548 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCallEvent_Single-5               	100000000	        10.13 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHandleStateSignal-5              	  162736	      6171 ns/op	    4400 B/op	     200 allocs/op
+BenchmarkHandleNotifySignal-5             	  259770	      4679 ns/op	    3200 B/op	     150 allocs/op
 PASS
-
-# 同机对比（GOMAXPROCS=5，AMD EPYC 9K65）
-# v1.6.0: HandleActionSignal(评论) ~8600 ns/op · 8426 B/op · 151 allocs/op
-# v1.6.0: Like                       ~11876 ns/op · 12429 B/op · 151 allocs/op
-# v1.6.0: EnterRoom                  ~11569 ns/op · 12429 B/op · 151 allocs/op
-# v1.6.0: Follow                     ~11611 ns/op · 12429 B/op · 151 allocs/op
-# v1.7.0: HandleActionSignal(评论)   ~ 6927 ns/op ·  8425 B/op · 151 allocs/op（持平，已近下限）
-# v1.7.0: Like                       ~ 5539 ns/op ·  5225 B/op · 101 allocs/op
-# v1.7.0: EnterRoom                  ~ 5513 ns/op ·  5225 B/op · 101 allocs/op
-# v1.7.0: Follow                     ~ 5556 ns/op ·  5225 B/op · 101 allocs/op
-# v1.7.0: Mixed                      ~ 7466 ns/op ·  5865 B/op · 121 allocs/op
-#
-# v1.7.0 主要优化：点赞/进房/关注三类高频信号的零嵌套分配轻量解析
-#   此前这三类信号仍走标准 proto.Unmarshal，每条弹幕都要 reflect.New 出 ZtLiveUserInfo 及其
-#   UserIdentity / Avatar 等嵌套消息（与评论热路径同构的分配与 CPU 来源）。v1.7.0 新增
-#   parseSimpleUserSignalFast（见 fastdecode.go），仅提取 SendTime（field 2 varint）与
-#   UserInfo（field 1 消息，复用 parseUserInfoFast），不构造任何嵌套 protobuf 消息；遇到非预期/
-#   截断编码返回 ok=false 后回退标准 proto.Unmarshal，正确性不被破坏（fastdecode_test.go 中
-#   快速路径与标准路径逐项比对一致，覆盖带徽章、带头像、带管理员类型、无 userInfo、附加未知字段等）。
-#   对比 v1.6.0（同机、同 benchtime 量级）：
-#     Like     ：11876 → 5539 ns/op（约 -53%）、12429 → 5225 B/op（约 -58%）、151 → 101 allocs（约 -33%）
-#     EnterRoom：11569 → 5513 ns/op（约 -52%）、12429 → 5225 B/op（约 -58%）、151 → 101 allocs（约 -33%）
-#     Follow   ：11611 → 5556 ns/op（约 -52%）、12429 → 5225 B/op（约 -58%）、151 → 101 allocs（约 -33%）
-#     Mixed    ：12173 → 7466 ns/op（约 -39%）、10193 → 5865 B/op（约 -42%）、151 → 121 allocs（约 -20%）
-#   评论热路径（BenchmarkHandleActionSignal）保持不变，无回归。
-#
-# 剩余分配的构成（v1.7.0，Like/EnterRoom/Follow 50 条/批次，约 101 allocs）：每条弹幕的
-# *Like/*EnterRoom/*FollowAuthor 结构体（1）、Nickname 字符串底层数组（1），合计约 2 allocs/条；
-# 这些是业务必需的独立拷贝，已接近热路径下限。
